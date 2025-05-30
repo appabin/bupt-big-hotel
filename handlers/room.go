@@ -75,6 +75,7 @@ func BookRoom(c *gin.Context) {
 	// 更新房间信息
 	checkinTime := time.Now()
 	checkoutTime := checkinTime.AddDate(0, 0, req.Days)
+	totalCost := float32(req.Days) * room.DailyRate
 
 	room.ClientID = strconv.Itoa(userID.(int))
 	room.ClientName = req.ClientName
@@ -89,6 +90,26 @@ func BookRoom(c *gin.Context) {
 		return
 	}
 
+	// 保存房间操作日志
+	roomOperation := models.RoomOperation{
+		RoomID:        req.RoomID,
+		ClientID:      strconv.Itoa(userID.(int)),
+		ClientName:    req.ClientName,
+		OperationType: "checkin",
+		OperationTime: checkinTime,
+		CheckinTime:   checkinTime,
+		CheckoutTime:  checkoutTime,
+		DailyRate:     room.DailyRate,
+		Deposit:       room.Deposit,
+		TotalCost:     totalCost,
+		ActualDays:    req.Days,
+	}
+
+	if err := database.DB.Create(&roomOperation).Error; err != nil {
+		// 记录日志失败不影响主要业务流程，只记录错误
+		// 可以考虑使用日志库记录这个错误
+	}
+
 	c.JSON(http.StatusOK, gin.H{
 		"message":       "订房成功",
 		"room_id":       room.RoomID,
@@ -97,7 +118,7 @@ func BookRoom(c *gin.Context) {
 		"checkout_time": room.CheckoutTime,
 		"daily_rate":    room.DailyRate,
 		"deposit":       room.Deposit,
-		"total_cost":    float32(req.Days) * room.DailyRate,
+		"total_cost":    totalCost,
 		"username":      username,
 	})
 }
@@ -139,6 +160,27 @@ func CheckoutRoom(c *gin.Context) {
 		actualDays = 1
 	}
 	actualCost := float32(actualDays) * room.DailyRate
+	checkoutTime := time.Now()
+
+	// 保存房间操作日志（在重置房间状态之前）
+	roomOperation := models.RoomOperation{
+		RoomID:        roomID,
+		ClientID:      room.ClientID,
+		ClientName:    room.ClientName,
+		OperationType: "checkout",
+		OperationTime: checkoutTime,
+		CheckinTime:   room.CheckinTime,
+		CheckoutTime:  checkoutTime,
+		DailyRate:     room.DailyRate,
+		Deposit:       room.Deposit,
+		TotalCost:     actualCost,
+		ActualDays:    actualDays,
+	}
+
+	if err := database.DB.Create(&roomOperation).Error; err != nil {
+		// 记录日志失败不影响主要业务流程，只记录错误
+		// 可以考虑使用日志库记录这个错误
+	}
 
 	// 重置房间状态
 	room.ClientID = ""
