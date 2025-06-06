@@ -64,17 +64,20 @@ func main() {
 			// 房间相关路由
 			rooms := auth.Group("/rooms")
 			{
-				rooms.GET("/available", handlers.GetAvailableRooms)       // 获取空房间
-				rooms.GET("/my", handlers.GetMyRooms)                     // 获取我的房间
-				rooms.POST("/book", handlers.BookRoom)                    // 订房
-				rooms.DELETE("/:room_id/checkout", handlers.CheckoutRoom) // 退房
+				rooms.GET("/by-type/:type_id", handlers.GetRoomsByType) // 获取房间信息
+				rooms.GET("/type", handlers.GetAllRoomTypes)            // 获取所有房间
+				rooms.GET("/available", handlers.GetAvailableRooms)     // 获取空房间
+				rooms.GET("/my", handlers.GetMyRooms)                   // 获取我的房间
+				rooms.POST("/book", handlers.BookRoom)                  // 订房
+				rooms.POST("/:room_id/checkout", handlers.CheckoutRoom) // 退房
 			}
 
 			// 空调相关路由
 			ac := auth.Group("/airconditioner")
 			{
-				ac.GET("/:room_id", handlers.GetAirConditioner)     // 获取房间空调信息
-				ac.PUT("/:room_id", handlers.ControlAirConditioner) // 控制空调
+				ac.GET("/:room_id", handlers.GetAirConditioner)             // 获取房间空调信息
+				ac.PUT("/:room_id", handlers.ControlAirConditioner)         // 控制空调
+				ac.GET("/:room_id/status", handlers.GetACStatusLongPolling) // 长轮询获取空调状态
 			}
 		}
 
@@ -84,6 +87,8 @@ func main() {
 		{
 			admin.GET("/rooms", handlers.GetAllRooms)                     // 获取所有房间
 			admin.GET("/airconditioners", handlers.GetAllAirConditioners) // 获取所有空调信息
+			admin.GET("/scheduler/status", handlers.GetSchedulerStatus)   // 获取调度器状态
+			admin.PUT("/room-types/:id", handlers.UpdateRoomType)         // 修改指定ID的房间类型
 		}
 	}
 
@@ -99,8 +104,10 @@ func main() {
 	log.Printf("  DELETE /api/auth/rooms/:room_id/checkout - 退房")
 	log.Printf("  GET  /api/auth/airconditioner/:room_id - 获取空调信息")
 	log.Printf("  PUT  /api/auth/airconditioner/:room_id - 控制空调")
+	log.Printf("  GET  /api/auth/airconditioner/:room_id/status - 长轮询获取空调状态")
 	log.Printf("  GET  /api/admin/rooms - 获取所有房间(管理员)")
 	log.Printf("  GET  /api/admin/airconditioners - 获取所有空调(管理员)")
+	log.Printf("  GET  /api/admin/scheduler/status - 获取空调调度器状态(管理员)")
 
 	if err := r.Run(config.ServerPort); err != nil {
 		log.Fatal("服务器启动失败:", err)
