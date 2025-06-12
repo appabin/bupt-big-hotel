@@ -94,9 +94,14 @@ func BookRoom(c *gin.Context) {
 		return
 	}
 
+	// 生成账单号：时间戳+房间号
+	billIDStr := fmt.Sprintf("%d%03d", checkinTime.Unix(), req.RoomID)
+	billID, _ := strconv.Atoi(billIDStr)
+
 	// 保存房间操作日志
 	roomOperation := models.RoomOperation{
 		RoomID:        req.RoomID,
+		BillID:        billID,
 		ClientID:      strconv.Itoa(userID.(int)),
 		ClientName:    req.ClientName,
 		OperationType: "checkin",
@@ -116,6 +121,7 @@ func BookRoom(c *gin.Context) {
 
 	c.JSON(http.StatusOK, gin.H{
 		"message":       "订房成功",
+		"bill_id":       billID,
 		"room_id":       room.RoomID,
 		"client_name":   room.ClientName,
 		"checkin_time":  room.CheckinTime,
@@ -158,6 +164,16 @@ func CheckoutRoom(c *gin.Context) {
 		return
 	}
 
+	// 获取当前入住的账单号
+	var checkinOperation models.RoomOperation
+	if err := database.DB.Where("room_id = ? AND operation_type = 'checkin'", roomID).Order("operation_time DESC").First(&checkinOperation).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"error": "无法找到入住记录",
+		})
+		return
+	}
+	billID := checkinOperation.BillID
+
 	// 计算实际费用
 	actualDays := int(time.Since(room.CheckinTime).Hours()/24) + 1
 	if actualDays < 1 {
@@ -166,9 +182,31 @@ func CheckoutRoom(c *gin.Context) {
 	actualCost := float32(actualDays) * room.DailyRate
 	checkoutTime := time.Now()
 
+	// 获取空调操作记录
+	var acOperations []models.AirConditionerOperation
+	if err := database.DB.Where("room_id = ? AND bill_id = ?", roomID, billID).Find(&acOperations).Error; err != nil {
+		// 如果没有空调操作记录，继续退房流程
+	}
+
+	// 获取空调详细记录
+	var acDetails []models.AirConditionerDetail
+	if err := database.DB.Where("room_id = ? AND bill_id = ?", roomID, billID).Find(&acDetails).Error; err != nil {
+		// 如果没有空调详细记录，继续退房流程
+	}
+
+	// 生成Excel文件
+	excelFile, err := generateACReportExcel(billID, roomID, acOperations, acDetails)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"error": "生成空调使用报告失败: " + err.Error(),
+		})
+		return
+	}
+
 	// 保存房间操作日志（在重置房间状态之前）
 	roomOperation := models.RoomOperation{
 		RoomID:        roomID,
+		BillID:        billID,
 		ClientID:      room.ClientID,
 		ClientName:    room.ClientName,
 		OperationType: "checkout",
@@ -183,7 +221,6 @@ func CheckoutRoom(c *gin.Context) {
 
 	if err := database.DB.Create(&roomOperation).Error; err != nil {
 		// 记录日志失败不影响主要业务流程，只记录错误
-		// 可以考虑使用日志库记录这个错误
 	}
 
 	// 重置房间状态
@@ -200,50 +237,114 @@ func CheckoutRoom(c *gin.Context) {
 		return
 	}
 
-	// 获取空调费用详单
-	var acDetails []models.Detail
-	var acTotalCost float32
-	database.DB.Where("room_id = ?", roomID).Find(&acDetails)
-	database.DB.Model(&models.Detail{}).Where("room_id = ?", roomID).Select("COALESCE(SUM(cost), 0)").Scan(&acTotalCost)
+	// 设置响应头并返回Excel文件
+	filename := fmt.Sprintf("空调使用报告_%d_%d.xlsx", checkinOperation.BillID, roomID)
+	c.Header("Content-Type", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+	c.Header("Content-Disposition", fmt.Sprintf("attachment; filename=%s", filename))
+	c.Header("Content-Transfer-Encoding", "binary")
 
-	// 关闭并重置房间空调
-	var ac models.AirConditioner
-	if err := database.DB.Where("room_id = ?", roomID).First(&ac).Error; err == nil {
-		// 重置空调状态
-		ac.ACState = 0                   // 关闭空调
-		ac.CurrentTemp = ac.InitialTemp  // 重置为初始温度
-		ac.TargetTemp = ac.InitialTemp   // 重置目标温度
-		ac.Mode = "cooling"              // 重置为制冷模式
-		ac.CurrentSpeed = "medium"       // 重置为中速
-		ac.LastPowerOnTime = time.Time{} // 清空最后开机时间
-		ac.SwitchCount = 0               // 重置开关次数
-		database.DB.Save(&ac)
+	// 将Excel文件写入响应
+	if err := excelFile.Write(c.Writer); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"error": "下载文件失败",
+		})
+		return
+	}
+}
+
+// generateACReportExcel 生成空调使用报告Excel文件
+func generateACReportExcel(billID int, roomID int, acOperations []models.AirConditionerOperation, acDetails []models.AirConditionerDetail) (*excelize.File, error) {
+	f := excelize.NewFile()
+	defer func() {
+		if err := f.Close(); err != nil {
+			fmt.Println(err)
+		}
+	}()
+
+	// 设置工作表名称
+	sheetName := "空调使用报告"
+	f.SetSheetName("Sheet1", sheetName)
+
+	// 设置标题
+	f.SetCellValue(sheetName, "A1", "空调使用报告")
+	f.SetCellValue(sheetName, "A2", fmt.Sprintf("账单号: %d", billID))
+	f.SetCellValue(sheetName, "A3", fmt.Sprintf("房间号: %d", roomID))
+	f.SetCellValue(sheetName, "A4", fmt.Sprintf("生成时间: %s", time.Now().Format("2006-01-02 15:04:05")))
+
+	// 空调操作记录表头
+	f.SetCellValue(sheetName, "A6", "空调操作记录")
+	f.SetCellValue(sheetName, "A7", "序号")
+	f.SetCellValue(sheetName, "B7", "操作时间")
+	f.SetCellValue(sheetName, "C7", "操作类型")
+	f.SetCellValue(sheetName, "D7", "目标温度")
+	f.SetCellValue(sheetName, "E7", "风速")
+	f.SetCellValue(sheetName, "F7", "模式")
+	f.SetCellValue(sheetName, "G7", "优先级")
+
+	// 填充空调操作数据
+	row := 8
+	for i, op := range acOperations {
+		f.SetCellValue(sheetName, fmt.Sprintf("A%d", row), i+1)
+		f.SetCellValue(sheetName, fmt.Sprintf("B%d", row), op.CreatedAt.Format("2006-01-02 15:04:05"))
+		f.SetCellValue(sheetName, fmt.Sprintf("C%d", row), op.OperationType)
+		f.SetCellValue(sheetName, fmt.Sprintf("D%d", row), op.TargetTemperature)
+		f.SetCellValue(sheetName, fmt.Sprintf("E%d", row), op.FanSpeed)
+		f.SetCellValue(sheetName, fmt.Sprintf("F%d", row), op.Mode)
+		f.SetCellValue(sheetName, fmt.Sprintf("G%d", row), op.Priority)
+		row++
 	}
 
-	// 导出空调操作详单到Excel文件
-	if len(acDetails) > 0 {
-		roomName := fmt.Sprintf("房间%d", room.RoomID)
-		exportACDetailsToExcel(roomName, acDetails, acTotalCost, ac)
+	// 空调详细记录表头
+	row += 2
+	f.SetCellValue(sheetName, fmt.Sprintf("A%d", row), "空调状态详细记录")
+	row++
+	f.SetCellValue(sheetName, fmt.Sprintf("A%d", row), "序号")
+	f.SetCellValue(sheetName, fmt.Sprintf("B%d", row), "记录时间")
+	f.SetCellValue(sheetName, fmt.Sprintf("C%d", row), "当前温度")
+	f.SetCellValue(sheetName, fmt.Sprintf("D%d", row), "目标温度")
+	f.SetCellValue(sheetName, fmt.Sprintf("E%d", row), "风速")
+	f.SetCellValue(sheetName, fmt.Sprintf("F%d", row), "模式")
+	f.SetCellValue(sheetName, fmt.Sprintf("G%d", row), "状态")
+	f.SetCellValue(sheetName, fmt.Sprintf("H%d", row), "当前费用")
+	f.SetCellValue(sheetName, fmt.Sprintf("I%d", row), "总费用")
+	row++
+
+	// 填充空调详细数据
+	for i, detail := range acDetails {
+		f.SetCellValue(sheetName, fmt.Sprintf("A%d", row), i+1)
+		f.SetCellValue(sheetName, fmt.Sprintf("B%d", row), detail.CreatedAt.Format("2006-01-02 15:04:05"))
+		f.SetCellValue(sheetName, fmt.Sprintf("C%d", row), detail.CurrentTemperature)
+		f.SetCellValue(sheetName, fmt.Sprintf("D%d", row), detail.TargetTemperature)
+		f.SetCellValue(sheetName, fmt.Sprintf("E%d", row), detail.FanSpeed)
+		f.SetCellValue(sheetName, fmt.Sprintf("F%d", row), detail.Mode)
+		f.SetCellValue(sheetName, fmt.Sprintf("G%d", row), detail.Status)
+		f.SetCellValue(sheetName, fmt.Sprintf("H%d", row), detail.CurrentCost)
+		f.SetCellValue(sheetName, fmt.Sprintf("I%d", row), detail.TotalCost)
+		row++
 	}
 
-	// 清空该房间的空调费用详单记录
-	database.DB.Where("room_id = ?", roomID).Delete(&models.Detail{})
+	// 计算总费用
+	var totalCost float32
+	for _, detail := range acDetails {
+		totalCost += detail.CurrentCost
+	}
 
-	// 计算总费用（房费 + 空调费）
-	totalBill := actualCost + acTotalCost
-	refund := room.Deposit - totalBill
+	// 添加汇总信息
+	row += 2
+	f.SetCellValue(sheetName, fmt.Sprintf("A%d", row), "汇总信息")
+	row++
+	f.SetCellValue(sheetName, fmt.Sprintf("A%d", row), fmt.Sprintf("总操作次数: %d", len(acOperations)))
+	row++
+	f.SetCellValue(sheetName, fmt.Sprintf("A%d", row), fmt.Sprintf("总状态记录数: %d", len(acDetails)))
+	row++
+	f.SetCellValue(sheetName, fmt.Sprintf("A%d", row), fmt.Sprintf("空调总费用: %.2f 元", totalCost))
 
-	c.JSON(http.StatusOK, gin.H{
-		"message":     "退房成功",
-		"room_id":     roomID,
-		"actual_days": actualDays,
-		"room_cost":   actualCost,
-		"ac_cost":     acTotalCost,
-		"total_cost":  totalBill,
-		"deposit":     room.Deposit,
-		"refund":      refund,
-		"ac_details":  acDetails,
-	})
+	// 设置列宽
+	f.SetColWidth(sheetName, "A", "A", 8)
+	f.SetColWidth(sheetName, "B", "B", 20)
+	f.SetColWidth(sheetName, "C", "I", 12)
+
+	return f, nil
 }
 
 // GetMyRooms 获取我的房间
@@ -433,7 +534,7 @@ func GetRoomsByType(c *gin.Context) {
 }
 
 // exportACDetailsToExcel 导出空调操作详单到Excel文件
-func exportACDetailsToExcel(roomName string, details []models.Detail, totalCost float32, ac models.AirConditioner) {
+func exportACDetailsToExcel(roomName string, details []models.AirConditionerDetail, totalCost float32, sessionCost float32, ac models.AirConditioner) {
 	// 创建新的Excel文件
 	f := excelize.NewFile()
 	defer func() {
@@ -443,11 +544,11 @@ func exportACDetailsToExcel(roomName string, details []models.Detail, totalCost 
 	}()
 
 	// 设置工作表名称
-	sheetName := "空调费用详单"
+	sheetName := "空调操作记录"
 	f.SetSheetName("Sheet1", sheetName)
 
 	// 设置表头
-	headers := []string{"序号", "服务时间(分钟)", "费用(元)", "费率", "风速", "模式", "温度变化", "当前温度", "目标温度", "记录时间"}
+	headers := []string{"序号", "操作类型", "风速", "模式", "当前温度", "目标温度", "操作时间"}
 	for i, header := range headers {
 		cell, _ := excelize.CoordinatesToCellName(i+1, 1)
 		f.SetCellValue(sheetName, cell, header)
@@ -457,55 +558,45 @@ func exportACDetailsToExcel(roomName string, details []models.Detail, totalCost 
 	for i, detail := range details {
 		row := i + 2
 		f.SetCellValue(sheetName, fmt.Sprintf("A%d", row), i+1)
-		f.SetCellValue(sheetName, fmt.Sprintf("B%d", row), detail.ServeTime)
-		f.SetCellValue(sheetName, fmt.Sprintf("C%d", row), fmt.Sprintf("%.2f", detail.Cost))
-		f.SetCellValue(sheetName, fmt.Sprintf("D%d", row), detail.Rate)
-		f.SetCellValue(sheetName, fmt.Sprintf("E%d", row), detail.Speed)
-		f.SetCellValue(sheetName, fmt.Sprintf("F%d", row), detail.Mode)
-		f.SetCellValue(sheetName, fmt.Sprintf("G%d", row), detail.TempChange)
-		f.SetCellValue(sheetName, fmt.Sprintf("H%d", row), fmt.Sprintf("%.1f°C", float64(detail.CurrentTemp)/10.0))
-		f.SetCellValue(sheetName, fmt.Sprintf("I%d", row), fmt.Sprintf("%.1f°C", float64(detail.TargetTemp)/10.0))
-		f.SetCellValue(sheetName, fmt.Sprintf("J%d", row), detail.QueryTime.Format("2006-01-02 15:04:05"))
+		f.SetCellValue(sheetName, fmt.Sprintf("B%d", row), detail.OperationType)
+		f.SetCellValue(sheetName, fmt.Sprintf("C%d", row), detail.Speed)
+		f.SetCellValue(sheetName, fmt.Sprintf("D%d", row), detail.Mode)
+		f.SetCellValue(sheetName, fmt.Sprintf("E%d", row), fmt.Sprintf("%.1f°C", float64(detail.CurrentTemp)/10.0))
+		f.SetCellValue(sheetName, fmt.Sprintf("F%d", row), fmt.Sprintf("%.1f°C", float64(detail.TargetTemp)/10.0))
+		f.SetCellValue(sheetName, fmt.Sprintf("G%d", row), detail.QueryTime.Format("2006-01-02 15:04:05"))
 	}
 
-	// 计算总开启时长（分钟）
-	totalServeTime := float32(0)
-	for _, detail := range details {
-		totalServeTime += detail.ServeTime
-	}
+	// 统计操作次数
+	operationCount := len(details)
 
 	// 添加总结信息
 	summaryRow := len(details) + 3
-	f.SetCellValue(sheetName, fmt.Sprintf("A%d", summaryRow), "总计")
-	f.SetCellValue(sheetName, fmt.Sprintf("C%d", summaryRow), fmt.Sprintf("%.2f元", totalCost))
+	f.SetCellValue(sheetName, fmt.Sprintf("A%d", summaryRow), "总操作次数")
+	f.SetCellValue(sheetName, fmt.Sprintf("B%d", summaryRow), fmt.Sprintf("%d次", operationCount))
 
-	// 添加总开启时长
-	totalTimeRow := summaryRow + 1
-	f.SetCellValue(sheetName, fmt.Sprintf("A%d", totalTimeRow), "总开启时长")
-	f.SetCellValue(sheetName, fmt.Sprintf("C%d", totalTimeRow), fmt.Sprintf("%.1f分钟", totalServeTime))
+	// 添加费用信息
+	summaryRow++
+	f.SetCellValue(sheetName, fmt.Sprintf("A%d", summaryRow), "本次开机花费")
+	f.SetCellValue(sheetName, fmt.Sprintf("B%d", summaryRow), fmt.Sprintf("%.2f元", sessionCost))
 
-	// 添加开机次数
-	switchCountRow := totalTimeRow + 1
-	f.SetCellValue(sheetName, fmt.Sprintf("A%d", switchCountRow), "开机次数")
-	f.SetCellValue(sheetName, fmt.Sprintf("C%d", switchCountRow), fmt.Sprintf("%d次", ac.SwitchCount))
+	summaryRow++
+	f.SetCellValue(sheetName, fmt.Sprintf("A%d", summaryRow), "总花费")
+	f.SetCellValue(sheetName, fmt.Sprintf("B%d", summaryRow), fmt.Sprintf("%.2f元", totalCost))
 
 	// 设置列宽
 	f.SetColWidth(sheetName, "A", "A", 8)  // 序号
-	f.SetColWidth(sheetName, "B", "B", 15) // 服务时间
-	f.SetColWidth(sheetName, "C", "C", 12) // 费用
-	f.SetColWidth(sheetName, "D", "D", 8)  // 费率
-	f.SetColWidth(sheetName, "E", "E", 10) // 风速
-	f.SetColWidth(sheetName, "F", "F", 10) // 模式
-	f.SetColWidth(sheetName, "G", "G", 12) // 温度变化
-	f.SetColWidth(sheetName, "H", "H", 12) // 当前温度
-	f.SetColWidth(sheetName, "I", "I", 12) // 目标温度
-	f.SetColWidth(sheetName, "J", "J", 20) // 记录时间
+	f.SetColWidth(sheetName, "B", "B", 15) // 操作类型
+	f.SetColWidth(sheetName, "C", "C", 10) // 风速
+	f.SetColWidth(sheetName, "D", "D", 10) // 模式
+	f.SetColWidth(sheetName, "E", "E", 12) // 当前温度
+	f.SetColWidth(sheetName, "F", "F", 12) // 目标温度
+	f.SetColWidth(sheetName, "G", "G", 20) // 操作时间
 
 	// 保存文件
-	filename := fmt.Sprintf("%s_空调费用详单_%s.xlsx", roomName, time.Now().Format("20060102_150405"))
+	filename := fmt.Sprintf("%s_空调操作记录_%s.xlsx", roomName, time.Now().Format("20060102_150405"))
 	if err := f.SaveAs(filename); err != nil {
 		fmt.Printf("保存Excel文件失败: %v\n", err)
 	} else {
-		fmt.Printf("空调费用详单已保存到: %s\n", filename)
+		fmt.Printf("空调操作记录已保存到: %s\n", filename)
 	}
 }

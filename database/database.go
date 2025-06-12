@@ -3,7 +3,6 @@ package database
 import (
 	"bupt-hotel/models"
 	"log"
-	"time"
 
 	"gorm.io/driver/sqlite"
 	"gorm.io/gorm"
@@ -25,7 +24,7 @@ func InitDatabase(databasePath string) error {
 		&models.RoomType{},
 		&models.RoomInfo{},
 		&models.AirConditioner{},
-		&models.Detail{},
+		&models.AirConditionerDetail{},
 		&models.RoomOperation{},
 	)
 	if err != nil {
@@ -56,8 +55,27 @@ func initializeData() {
 	var roomCount int64
 	DB.Model(&models.RoomInfo{}).Count(&roomCount)
 	if roomCount == 0 {
-		// 创建10个示例房间，分配不同的房间类型
-		for j := 1; j <= 4; j++ {
+
+		var TestRoomTemp = []int{100, 150, 180, 120, 140}
+		var TestRoomDailyRate = []int{100, 125, 150, 200, 100}
+		for i := 1; i <= 5; i++ {
+			room := models.RoomInfo{
+				RoomID:     100 + i,
+				RoomTypeID: 1,
+				State:      0, // 空房
+				DailyRate:  float32(TestRoomDailyRate[i-1]),
+				Deposit:    500.00,
+			}
+			DB.Create(&room)
+			ac := models.AirConditioner{
+				ID:              100 + i,
+				RoomID:          100 + i,
+				EnvironmentTemp: TestRoomTemp[i-1],
+			}
+			DB.Create(&ac)
+		}
+
+		for j := 2; j <= 5; j++ {
 			for i := 1; i <= 10; i++ {
 				// 循环分配房间类型 (1-4)
 				roomTypeID := j
@@ -73,14 +91,8 @@ func initializeData() {
 				// 为每个房间创建对应的空调
 				ac := models.AirConditioner{
 					RoomID:          j*100 + i,
-					ACState:         0, // 关闭
-					Mode:            "cooling",
-					CurrentSpeed:    "low",
-					CurrentTemp:     250,
-					TargetTemp:      250,
-					InitialTemp:     250,
-					LastPowerOnTime: time.Now(),
-					SwitchCount:     0,
+					ID:              j*100 + i,
+					EnvironmentTemp: 150,
 				}
 				DB.Create(&ac)
 			}

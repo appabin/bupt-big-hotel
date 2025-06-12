@@ -6,6 +6,12 @@ import "github.com/lib/pq"
 func GetDefaultRoomTypes() []RoomType {
 	return []RoomType{
 		{
+			Type:        "测试房间",
+			Description: "测试制热空调使用",
+			PriceRange:  "100-200元",
+			Features:    pq.StringArray{"单人床", "制热测试", "空调"},
+		},
+		{
 			Type:        "单人间",
 			Description: "适合单人住宿，经济实惠",
 			PriceRange:  "150-280元",

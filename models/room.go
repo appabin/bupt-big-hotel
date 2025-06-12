@@ -31,41 +31,11 @@ type RoomInfo struct {
 	Deposit      float32   `gorm:"type:float(10,2)"` // 押金
 }
 
-// 空调信息表
-type AirConditioner struct {
-	ID              int       `gorm:"primaryKey"`
-	RoomID          int       `gorm:"type:int;index"`   // 关联房间ID
-	ACState         int       `gorm:"type:int"`         // 0: 关闭 1: 开启
-	Mode            string    `gorm:"type:varchar(20)"` // cooling/heating
-	CurrentSpeed    string    `gorm:"type:varchar(255)"`
-	CurrentTemp     int       `gorm:"type:int"`      // 当前温度*10，如245表示24.5度
-	TargetTemp      int       `gorm:"type:int"`      // 目标温度*10，如245表示24.5度
-	InitialTemp     int       `gorm:"type:int"`      // 初始温度*10，如245表示24.5度
-	LastPowerOnTime time.Time `gorm:"type:datetime"` // 记录最后一次开机时间
-	SwitchCount     int       `gorm:"type:int;default:0"`
-}
-
-// 空调操作详情表
-type Detail struct {
-	ID          int       `gorm:"primary_key"`
-	RoomID      int       `gorm:"type:int"`
-	QueryTime   time.Time `gorm:"type:datetime"`
-	StartTime   time.Time `gorm:"type:datetime"`
-	EndTime     time.Time `gorm:"type:datetime"`
-	ServeTime   float32   `gorm:"type:float(7,2)"` // 服务时长(分钟)
-	Speed       string    `gorm:"type:varchar(255)"`
-	Mode        string    `gorm:"type:varchar(255)"` // 空调模式：cooling/heating
-	Cost        float32   `gorm:"type:float(7,2)"`   // 费用(元)
-	Rate        float32   `gorm:"type:float(5,2)"`   // 每分钟费率(元/分钟)
-	TempChange  int       `gorm:"type:int"`          // 温度变化*10
-	CurrentTemp int       `gorm:"type:int"`          // 当前温度*10
-	TargetTemp  int       `gorm:"type:int"`          // 目标温度*10
-}
-
-// 房间操作记录表
+// 房间账单记录表
 type RoomOperation struct {
 	ID            int       `gorm:"primaryKey"`
 	RoomID        int       `gorm:"type:int;index"`
+	BillID        int       `gorm:"type:int;index"` // 账单号，与空调操作表保持一致
 	ClientID      string    `gorm:"type:varchar(255)"`
 	ClientName    string    `gorm:"type:varchar(255)"`
 	OperationType string    `gorm:"type:varchar(50)"` // checkin, checkout

@@ -9,24 +9,19 @@ import (
 	"time"
 )
 
-// abs 返回整数的绝对值
-func abs(x int) int {
-	if x < 0 {
-		return -x
-	}
-	return x
-}
-
 // ACRequest 空调请求结构
 type ACRequest struct {
-	RoomID       int
-	ACState      int
-	Mode         string
-	CurrentSpeed string
-	TargetTemp   int // 目标温度*10，如245表示24.5度
-	RequestTime  time.Time
-	StartTime    time.Time
-	Priority     int // 1: high, 2: medium, 3: low
+	BillID        int
+	RoomID        int
+	ACID          int
+	ACState       int //0-运行 1-暂停服务 2-停机
+	Mode          string
+	CurrentSpeed  string
+	TargetTemp    int
+	RequestTime   time.Time
+	StartTime     time.Time
+	Priority      int // 1: high, 2: medium, 3: low
+	OperationType int // 0: 开机, 1: 关机, 2: 调温
 }
 
 // ACScheduler 空调调度器
@@ -36,6 +31,7 @@ type ACScheduler struct {
 	waitingQueue []*ACRequest // 等待队列
 	ticker       *time.Ticker
 	stopChan     chan bool
+	warmBackMap  map[int]*ACRequest // 回温程序中的空调
 }
 
 // 全局调度器
@@ -50,8 +46,9 @@ func GetScheduler() *ACScheduler {
 		scheduler = &ACScheduler{
 			servingQueue: make([]*ACRequest, 0, 3),
 			waitingQueue: make([]*ACRequest, 0),
-			ticker:       time.NewTicker(time.Second), // 每秒检查一次
+			ticker:       time.NewTicker(6 * time.Second), // 每6秒检查一次
 			stopChan:     make(chan bool),
+			warmBackMap:  make(map[int]*ACRequest),
 		}
 		go scheduler.run()
 	})
@@ -60,13 +57,19 @@ func GetScheduler() *ACScheduler {
 
 // 调度器运行逻辑
 func (s *ACScheduler) run() {
+	scheduleCounter := 0
 	for {
 		select {
 		case <-s.ticker.C:
-			s.logQueueStatus()
 			s.updateTemperatures()
-			s.checkTimeSlices()
-			s.scheduleNext()
+			s.logQueueStatus()
+			scheduleCounter++
+			// 每分钟进行一次调度（10次6秒 = 60秒）
+			if scheduleCounter >= 10 {
+				s.checkTimeSlices()
+				s.scheduleNext()
+				scheduleCounter = 0
+			}
 		case <-s.stopChan:
 			return
 		}
@@ -83,15 +86,17 @@ func (s *ACScheduler) logQueueStatus() {
 	for _, req := range s.servingQueue {
 		serviceTime := time.Since(req.StartTime).Minutes()
 		// 获取当前房间温度和费用
-		var ac models.AirConditioner
 		currentTemp := "未知"
 		totalCost := float32(0)
-		if err := database.DB.Where("room_id = ?", req.RoomID).First(&ac).Error; err == nil {
-			currentTemp = fmt.Sprintf("%.1f°C", float32(ac.CurrentTemp)/10.0)
+		
+		// 从最新的状态记录获取当前温度
+		var lastDetail models.AirConditionerDetail
+		if err := database.DB.Where("room_id = ? AND bill_id = ?", req.RoomID, req.BillID).Order("created_at DESC").First(&lastDetail).Error; err == nil {
+			currentTemp = fmt.Sprintf("%.1f°C", float32(lastDetail.CurrentTemp)/10.0)
 		}
 		// 获取总费用
-		database.DB.Model(&models.Detail{}).Where("room_id = ?", req.RoomID).Select("COALESCE(SUM(cost), 0)").Scan(&totalCost)
-		servingInfo = append(servingInfo, fmt.Sprintf("房间%d(优先级%d,已服务%.1f分钟,当前温度%s,已花费%.2f元)", req.RoomID, req.Priority, serviceTime, currentTemp, totalCost))
+		database.DB.Model(&models.AirConditionerDetail{}).Where("room_id = ? AND bill_id = ?", req.RoomID, req.BillID).Select("COALESCE(SUM(current_cost), 0)").Scan(&totalCost)
+		servingInfo = append(servingInfo, fmt.Sprintf("房间%d(订单%d,优先级%d,已服务%.1f分钟,当前温度%s,已花费%.2f元)", req.RoomID, req.BillID, req.Priority, serviceTime, currentTemp, totalCost))
 	}
 
 	// 构建等待队列信息
@@ -99,15 +104,17 @@ func (s *ACScheduler) logQueueStatus() {
 	for i, req := range s.waitingQueue {
 		waitTime := time.Since(req.RequestTime).Minutes()
 		// 获取当前房间温度和费用
-		var ac models.AirConditioner
 		currentTemp := "未知"
 		totalCost := float32(0)
-		if err := database.DB.Where("room_id = ?", req.RoomID).First(&ac).Error; err == nil {
-			currentTemp = fmt.Sprintf("%.1f°C", float32(ac.CurrentTemp)/10.0)
+		
+		// 从最新的状态记录获取当前温度
+		var lastDetail models.AirConditionerDetail
+		if err := database.DB.Where("room_id = ? AND bill_id = ?", req.RoomID, req.BillID).Order("created_at DESC").First(&lastDetail).Error; err == nil {
+			currentTemp = fmt.Sprintf("%.1f°C", float32(lastDetail.CurrentTemp)/10.0)
 		}
 		// 获取总费用
-		database.DB.Model(&models.Detail{}).Where("room_id = ?", req.RoomID).Select("COALESCE(SUM(cost), 0)").Scan(&totalCost)
-		waitingInfo = append(waitingInfo, fmt.Sprintf("房间%d(优先级%d,等待%.1f分钟,位置%d,当前温度%s,已花费%.2f元)", req.RoomID, req.Priority, waitTime, i+1, currentTemp, totalCost))
+		database.DB.Model(&models.AirConditionerDetail{}).Where("room_id = ? AND bill_id = ?", req.RoomID, req.BillID).Select("COALESCE(SUM(current_cost), 0)").Scan(&totalCost)
+		waitingInfo = append(waitingInfo, fmt.Sprintf("房间%d(订单%d,优先级%d,等待%.1f分钟,位置%d,当前温度%s,已花费%.2f元)", req.RoomID, req.BillID, req.Priority, waitTime, i+1, currentTemp, totalCost))
 	}
 
 	// 输出日志
@@ -138,90 +145,127 @@ func (s *ACScheduler) updateTemperatures() {
 
 	// 更新所有关机空调的回温
 	s.updateOfflineTemperatures()
+
+	// 更新回温程序中的空调
+	s.updateWarmBackTemperatures()
 }
 
 // 更新单个空调温度
 func (s *ACScheduler) updateACTemperature(req *ACRequest) {
+	// 获取空调基础信息
 	var ac models.AirConditioner
 	if err := database.DB.Where("room_id = ?", req.RoomID).First(&ac).Error; err != nil {
 		return
 	}
 
-	if ac.ACState == 0 {
+	// 获取最新的操作记录
+	var operation models.AirConditionerOperation
+	if err := database.DB.Where("room_id = ? AND bill_id = ?", req.RoomID, req.BillID).Order("created_at DESC").First(&operation).Error; err != nil {
 		return
 	}
 
-	// 计算温度变化 - 每6秒刷新一次，温度变化量为1（相当于0.1度）
+	// 如果是关机状态，不进行温度更新
+	if operation.OperationState == 1 {
+		return
+	}
+
+	// 计算温度变化 - 每6秒刷新一次
 	var tempChange int
 	serviceSeconds := time.Since(req.StartTime).Seconds()
 
-	// 每6秒检查一次温度变化
-	if int(serviceSeconds)%6 == 0 && serviceSeconds >= 6 {
-		switch req.CurrentSpeed {
-		case "high":
-			tempChange = 1 // 高速风每6秒变化1（0.1度）
-		case "medium":
-			// 中速风每12秒变化1（0.1度）
-			if int(serviceSeconds)%12 == 0 {
-				tempChange = 1
-			}
-		case "low":
-			// 低速风每18秒变化1（0.1度）
-			if int(serviceSeconds)%18 == 0 {
-				tempChange = 1
-			}
+	// 根据风速计算温度变化
+	switch req.CurrentSpeed {
+	case "high":
+		// 高风：每分钟1度，每6秒0.1度
+		tempChange = 1
+	case "medium":
+		// 中风：每2分钟1度，每12秒0.1度
+		if int(serviceSeconds)%12 == 0 && serviceSeconds >= 12 {
+			tempChange = 1
 		}
+	case "low":
+		// 低风：每3分钟1度，每18秒0.1度
+		if int(serviceSeconds)%18 == 0 && serviceSeconds >= 18 {
+			tempChange = 1
+		}
+	}
+
+	// 获取当前温度（从最新的状态记录或操作记录）
+	currentTemp := operation.CurrentTemp
+	var lastDetail models.AirConditionerDetail
+	if err := database.DB.Where("room_id = ? AND bill_id = ?", req.RoomID, req.BillID).Order("created_at DESC").First(&lastDetail).Error; err == nil {
+		currentTemp = lastDetail.CurrentTemp
 	}
 
 	// 根据模式调整温度
 	if tempChange > 0 {
-		oldTemp := ac.CurrentTemp
+		oldTemp := currentTemp
+		newTemp := currentTemp
+		
 		if req.Mode == "cooling" {
-			if ac.CurrentTemp > req.TargetTemp {
-				ac.CurrentTemp -= tempChange
-				if ac.CurrentTemp <= req.TargetTemp {
-					ac.CurrentTemp = req.TargetTemp
+			if currentTemp > req.TargetTemp {
+				newTemp = currentTemp - tempChange
+				if newTemp <= req.TargetTemp {
+					newTemp = req.TargetTemp
 					// 达到目标温度，进入回温模式
 					s.startWarmBack(req)
 				}
 			}
 		} else if req.Mode == "heating" {
-			if ac.CurrentTemp < req.TargetTemp {
-				ac.CurrentTemp += tempChange
-				if ac.CurrentTemp >= req.TargetTemp {
-					ac.CurrentTemp = req.TargetTemp
+			if currentTemp < req.TargetTemp {
+				newTemp = currentTemp + tempChange
+				if newTemp >= req.TargetTemp {
+					newTemp = req.TargetTemp
 					// 达到目标温度，进入回温模式
 					s.startWarmBack(req)
 				}
 			}
 		}
 
-		// 计算费用：每变化1度（10个单位）收费1元
-		actualTempChange := abs(ac.CurrentTemp - oldTemp)
+		// 计算费用：温度变化量等于消费金额
+		actualTempChange := abs(newTemp - oldTemp)
 		if actualTempChange > 0 {
-			// 每10个单位（1度）收费1元，按比例计算
+			// 每变化0.1度收费0.1元
 			cost := float32(actualTempChange) / 10.0
 
-			// 记录计费详情
-			detail := models.Detail{
-				RoomID:      req.RoomID,
-				QueryTime:   time.Now(),
-				StartTime:   req.StartTime,
-				EndTime:     time.Now(),
-				ServeTime:   float32(time.Since(req.StartTime).Minutes()),
-				Speed:       req.CurrentSpeed,
-				Mode:        req.Mode,
-				Cost:        cost,
-				Rate:        cost / float32(time.Since(req.StartTime).Minutes()),
-				TempChange:  actualTempChange,
-				CurrentTemp: ac.CurrentTemp,
-				TargetTemp:  req.TargetTemp,
+			// 获取总费用
+			var totalCost float32
+			database.DB.Model(&models.AirConditionerDetail{}).Where("room_id = ? AND bill_id = ?", req.RoomID, req.BillID).Select("COALESCE(SUM(current_cost), 0)").Scan(&totalCost)
+			totalCost += cost
+
+			// 创建状态记录
+			detail := models.AirConditionerDetail{
+				BillID:          req.BillID,
+				RoomID:          req.RoomID,
+				AcID:            req.ACID,
+				OperationType:   0, // 系统自动记录
+				ACStatus:        0, // 运行状态
+				Speed:           req.CurrentSpeed,
+				Mode:            req.Mode,
+				TargetTemp:      req.TargetTemp,
+				EnvironmentTemp: ac.EnvironmentTemp,
+				CurrentTemp:     newTemp,
+				CurrentCost:     cost,
+				TotalCost:       totalCost,
+				QueryTime:       time.Now(),
+				StartTime:       req.StartTime,
+				EndTime:         time.Now(),
+				ServeTime:       float32(time.Since(req.StartTime).Seconds()) / 60.0,
+				QueueWaitTime:   0,
+				Rate:            1.0,
+				TempChange:      actualTempChange,
 			}
 			database.DB.Create(&detail)
 		}
-
-		database.DB.Save(&ac)
 	}
+}
+
+// abs 返回整数的绝对值
+func abs(x int) int {
+	if x < 0 {
+		return -x
+	}
+	return x
 }
 
 // 开始回温程序
@@ -234,67 +278,148 @@ func (s *ACScheduler) startWarmBack(req *ACRequest) {
 		}
 	}
 
-	// 启动回温协程
-	go s.warmBackProcess(req)
+	// 添加到回温程序
+	req.StartTime = time.Now() // 重置开始时间用于回温计时
+	s.warmBackMap[req.RoomID] = req
 }
 
-// 回温过程
-func (s *ACScheduler) warmBackProcess(req *ACRequest) {
-	ticker := time.NewTicker(12 * time.Second)
-	defer ticker.Stop()
-
-	warmBackCount := 0
-
-	for range ticker.C {
-		var ac models.AirConditioner
-		if err := database.DB.Where("room_id = ?", req.RoomID).First(&ac).Error; err != nil {
-			return
-		}
-
-		// 每12秒回温1个单位（0.1度）
-		if req.Mode == "cooling" {
-			ac.CurrentTemp += 1
-		} else {
-			ac.CurrentTemp -= 1
-		}
-
-		warmBackCount++
-		database.DB.Save(&ac)
-
-		// 回温1度后重新发送温控请求
-		if warmBackCount >= 10 { // 10次 * 12秒 * 1单位 = 10单位（1度）
+// 更新回温程序中的空调温度
+func (s *ACScheduler) updateWarmBackTemperatures() {
+	currentTime := time.Now()
+	for roomID, req := range s.warmBackMap {
+		// 检查是否已经回温2分钟
+		if currentTime.Sub(req.StartTime) >= 2*time.Minute {
+			// 重新加入调度队列
+			req.RequestTime = currentTime
 			s.AddRequest(req)
-			return
+			delete(s.warmBackMap, roomID)
+			continue
+		}
+
+		// 每分钟回温0.5度
+		if int(currentTime.Sub(req.StartTime).Seconds())%60 == 0 && currentTime.Sub(req.StartTime).Seconds() >= 60 {
+			// 获取空调基础信息
+			var ac models.AirConditioner
+			if err := database.DB.Where("room_id = ?", roomID).First(&ac).Error; err != nil {
+				continue
+			}
+
+			// 获取当前温度
+			currentTemp := ac.EnvironmentTemp
+			var lastDetail models.AirConditionerDetail
+			if err := database.DB.Where("room_id = ? AND bill_id = ?", roomID, req.BillID).Order("created_at DESC").First(&lastDetail).Error; err == nil {
+				currentTemp = lastDetail.CurrentTemp
+			}
+
+			// 向初始温度回温0.5度（5个单位）
+			newTemp := currentTemp
+			if currentTemp > ac.EnvironmentTemp {
+				newTemp = currentTemp - 5
+				if newTemp < ac.EnvironmentTemp {
+					newTemp = ac.EnvironmentTemp
+				}
+			} else if currentTemp < ac.EnvironmentTemp {
+				newTemp = currentTemp + 5
+				if newTemp > ac.EnvironmentTemp {
+					newTemp = ac.EnvironmentTemp
+				}
+			}
+
+			// 创建回温状态记录
+			if newTemp != currentTemp {
+				detail := models.AirConditionerDetail{
+					BillID:          req.BillID,
+					RoomID:          roomID,
+					AcID:            req.ACID,
+					OperationType:   3, // 回温程序
+					ACStatus:        1, // 暂停服务状态
+					Speed:           req.CurrentSpeed,
+					Mode:            req.Mode,
+					TargetTemp:      req.TargetTemp,
+					EnvironmentTemp: ac.EnvironmentTemp,
+					CurrentTemp:     newTemp,
+					CurrentCost:     0, // 回温不产生费用
+					TotalCost:       0,
+					QueryTime:       currentTime,
+					StartTime:       req.StartTime,
+					EndTime:         currentTime,
+					ServeTime:       0,
+					QueueWaitTime:   0,
+					Rate:            0,
+					TempChange:      abs(newTemp - currentTemp),
+				}
+				database.DB.Create(&detail)
+			}
 		}
 	}
 }
 
 // 更新关机空调的回温
 func (s *ACScheduler) updateOfflineTemperatures() {
-	var acs []models.AirConditioner
-	database.DB.Where("ac_state = ?", 0).Find(&acs)
+	// 获取所有关机状态的操作记录
+	var operations []models.AirConditionerOperation
+	database.DB.Where("operation_state = ?", 1).Find(&operations)
 
-	// 获取当前时间的秒数，每12秒执行一次温度变化
+	// 每分钟执行一次温度变化
 	currentSeconds := time.Now().Unix()
-	if currentSeconds%12 != 0 {
+	if currentSeconds%60 != 0 {
 		return
 	}
 
-	for _, ac := range acs {
-		// 关机时每12秒向初始温度变化1个单位（0.1度）
-		if ac.CurrentTemp != ac.InitialTemp {
-			if ac.CurrentTemp > ac.InitialTemp {
-				ac.CurrentTemp -= 1
-				if ac.CurrentTemp < ac.InitialTemp {
-					ac.CurrentTemp = ac.InitialTemp
+	for _, operation := range operations {
+		// 获取空调基础信息
+		var ac models.AirConditioner
+		if err := database.DB.Where("room_id = ?", operation.RoomID).First(&ac).Error; err != nil {
+			continue
+		}
+
+		// 获取当前温度（从最新的状态记录）
+		currentTemp := operation.CurrentTemp
+		var lastDetail models.AirConditionerDetail
+		if err := database.DB.Where("room_id = ? AND bill_id = ?", operation.RoomID, operation.BillID).Order("created_at DESC").First(&lastDetail).Error; err == nil {
+			currentTemp = lastDetail.CurrentTemp
+		}
+
+		// 关机时每分钟向初始温度回温0.5度（5个单位）
+		if currentTemp != ac.EnvironmentTemp {
+			newTemp := currentTemp
+			if currentTemp > ac.EnvironmentTemp {
+				newTemp = currentTemp - 5
+				if newTemp < ac.EnvironmentTemp {
+					newTemp = ac.EnvironmentTemp
 				}
 			} else {
-				ac.CurrentTemp += 1
-				if ac.CurrentTemp > ac.InitialTemp {
-					ac.CurrentTemp = ac.InitialTemp
+				newTemp = currentTemp + 5
+				if newTemp > ac.EnvironmentTemp {
+					newTemp = ac.EnvironmentTemp
 				}
 			}
-			database.DB.Save(&ac)
+
+			// 创建回温状态记录
+			if newTemp != currentTemp {
+				detail := models.AirConditionerDetail{
+					BillID:          operation.BillID,
+					RoomID:          operation.RoomID,
+					AcID:            operation.AcID,
+					OperationType:   1, // 关机回温
+					ACStatus:        2, // 停机状态
+					Speed:           operation.Speed,
+					Mode:            operation.Mode,
+					TargetTemp:      operation.TargetTemp,
+					EnvironmentTemp: ac.EnvironmentTemp,
+					CurrentTemp:     newTemp,
+					CurrentCost:     0, // 关机不产生费用
+					TotalCost:       0,
+					QueryTime:       time.Now(),
+					StartTime:       time.Now(),
+					EndTime:         time.Now(),
+					ServeTime:       0,
+					QueueWaitTime:   0,
+					Rate:            0,
+					TempChange:      abs(newTemp - currentTemp),
+				}
+				database.DB.Create(&detail)
+			}
 		}
 	}
 }
@@ -307,7 +432,6 @@ func (s *ACScheduler) checkTimeSlices() {
 	now := time.Now()
 	for i := len(s.servingQueue) - 1; i >= 0; i-- {
 		req := s.servingQueue[i]
-		// 只有同优先级的请求才使用时间片调度
 		// 检查是否有同优先级的请求在等待
 		hasSamePriorityWaiting := false
 		for _, waitingReq := range s.waitingQueue {
@@ -495,6 +619,9 @@ func (s *ACScheduler) RemoveRequest(roomID int) {
 			return
 		}
 	}
+
+	// 从回温程序中移除
+	delete(s.warmBackMap, roomID)
 }
 
 // GetServingQueue 获取服务队列（只读）

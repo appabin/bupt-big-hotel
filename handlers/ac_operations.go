@@ -12,69 +12,35 @@ import (
 
 // ACControlRequest 空调控制请求结构
 type ACControlRequest struct {
-	ACState      *int    `json:"ac_state,omitempty"`      // 0: 关闭 1: 开启
-	Mode         *string `json:"mode,omitempty"`          // cooling/heating
-	CurrentSpeed *string `json:"current_speed,omitempty"` // low/medium/high
-	TargetTemp   *int    `json:"target_temp,omitempty"`   // 目标温度*10，如245表示24.5度
+	BillID        int `json:"bill_id"`               // 订单号
+	OperationType int    `json:"operation_type"`        // 操作类型：0-开机 1-关机 2-调温
+	Speed         string `json:"speed,omitempty"`       // 风速：high/medium/low
+	Mode          string `json:"mode,omitempty"`        // 模式：cooling/heating
+	TargetTemp    int    `json:"target_temp,omitempty"` // 目标温度*10
 }
 
 // ACStatusResponse 空调状态响应结构
 type ACStatusResponse struct {
-	ServiceStatus     string  `json:"service_status"`      // 服务状态：服务中/等待服务/暂停服务/已关机
-	CurrentTemp       int     `json:"current_temp"`        // 当前温度*10，如245表示24.5度
-	TargetTemp        int     `json:"target_temp"`         // 目标温度*10，如245表示24.5度
-	CurrentSpeed      string  `json:"current_speed"`       // 当前风速
-	TotalCost         float32 `json:"total_cost"`          // 累计总费用
-	SessionCost       float32 `json:"session_cost"`        // 本次开机费用
-	ACState           int     `json:"ac_state"`            // 空调状态
-	Mode              string  `json:"mode"`                // 模式
-	QueuePosition     int     `json:"queue_position"`      // 队列位置（0表示不在队列中）
-	EstimatedWaitTime int     `json:"estimated_wait_time"` // 预计等待时间（分钟）
-}
-
-// GetAirConditioner 获取房间空调信息
-func GetAirConditioner(c *gin.Context) {
-	roomIDStr := c.Param("room_id")
-	roomID, err := strconv.Atoi(roomIDStr)
-	if err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{
-			"error": "无效的房间ID",
-		})
-		return
-	}
-
-	// 检查用户是否有权限访问该房间
-	if !checkRoomPermission(c, roomID) {
-		return
-	}
-
-	var ac models.AirConditioner
-	if err := database.DB.Where("room_id = ?", roomID).First(&ac).Error; err != nil {
-		c.JSON(http.StatusNotFound, gin.H{
-			"error": "空调信息不存在",
-		})
-		return
-	}
-
-	c.JSON(http.StatusOK, gin.H{
-		"message":         "获取空调信息成功",
-		"air_conditioner": ac,
-	})
+	RoomID          int     `json:"room_id"`
+	ACStatus        int     `json:"ac_status"`        // 0: 运行 1: 暂停服务 2: 停机
+	Speed           string  `json:"speed"`            // 风速：high/medium/low
+	Mode            string  `json:"mode"`             // 模式：cooling/heating
+	TargetTemp      int     `json:"target_temp"`      // 目标温度*10
+	EnvironmentTemp int     `json:"environment_temp"` // 环境温度*10
+	CurrentTemp     int     `json:"current_temp"`     // 当前温度*10
+	CurrentCost     float32 `json:"current_cost"`     // 当前花费金额
+	TotalCost       float32 `json:"total_cost"`       // 总花费金额
+	Rate            float32 `json:"rate"`             // 每分钟费率(元/分钟)
 }
 
 // ControlAirConditioner 控制空调
 func ControlAirConditioner(c *gin.Context) {
-	roomIDStr := c.Param("room_id")
-	roomID, err := strconv.Atoi(roomIDStr)
-	if err != nil {
+	// 从URL路径参数获取房间ID
+	roomID := c.Param("room_id")
+	if roomID == "" {
 		c.JSON(http.StatusBadRequest, gin.H{
-			"error": "无效的房间ID",
+			"error": "房间ID不能为空",
 		})
-		return
-	}
-
-	// 检查用户是否有权限访问该房间
-	if !checkRoomPermission(c, roomID) {
 		return
 	}
 
@@ -86,119 +52,189 @@ func ControlAirConditioner(c *gin.Context) {
 		return
 	}
 
-	// 获取调度器
-	scheduler := GetScheduler()
+	// 验证订单号
+	if req.BillID == 0 {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"error": "订单号不能为空",
+		})
+		return
+	}
 
-	// 更新空调状态
-	updated := false
+	// 根据房间ID获取空调信息
 	var ac models.AirConditioner
 	if err := database.DB.Where("room_id = ?", roomID).First(&ac).Error; err != nil {
 		c.JSON(http.StatusNotFound, gin.H{
-			"error": "空调信息不存在",
+			"error": "该房间的空调不存在",
 		})
 		return
 	}
 
-	if req.ACState != nil {
-		if ac.ACState != *req.ACState {
-			ac.ACState = *req.ACState
-			if ac.ACState == 1 {
-				ac.LastPowerOnTime = time.Now()
-			} else {
-				// 关机时从调度器中移除
-				scheduler.RemoveRequest(roomID)
-			}
-			updated = true
+	currentTime := time.Now()
+
+	// 创建空调操作记录
+	operation := models.AirConditionerOperation{
+		BillID:            req.BillID,
+		RoomID:            ac.RoomID,
+		AcID:              ac.ID,
+		OperationState:    req.OperationType,
+		LastOperationTime: currentTime,
+	}
+
+	// 根据操作类型设置参数
+	switch req.OperationType {
+	case 0: // 开机
+		operation.Mode = "heating" // 默认制热
+		operation.TargetTemp = 220 // 默认22度
+		operation.Speed = "medium" // 默认中风
+		operation.LastPowerOnTime = currentTime
+		operation.SwitchCount = 1
+		// 如果用户指定了参数，使用用户参数
+		if req.Mode != "" {
+			operation.Mode = req.Mode
+		}
+		if req.TargetTemp > 0 {
+			operation.TargetTemp = req.TargetTemp
+		}
+		if req.Speed != "" {
+			operation.Speed = req.Speed
+		}
+
+	case 1: // 关机
+		// 关机操作，获取当前设置
+		var lastOp models.AirConditionerOperation
+		if err := database.DB.Where("room_id = ? AND bill_id = ?", ac.RoomID, req.BillID).Order("created_at DESC").First(&lastOp).Error; err == nil {
+			operation.Mode = lastOp.Mode
+			operation.TargetTemp = lastOp.TargetTemp
+			operation.Speed = lastOp.Speed
+			operation.SwitchCount = lastOp.SwitchCount + 1
+		}
+
+	case 2: // 调温或其他设置
+		// 获取当前设置作为基础
+		var lastOp models.AirConditionerOperation
+		if err := database.DB.Where("room_id = ? AND bill_id = ?", ac.RoomID, req.BillID).Order("created_at DESC").First(&lastOp).Error; err == nil {
+			operation.Mode = lastOp.Mode
+			operation.TargetTemp = lastOp.TargetTemp
+			operation.Speed = lastOp.Speed
+			operation.SwitchCount = lastOp.SwitchCount
+		}
+		// 更新用户指定的设置
+		if req.Speed != "" {
+			operation.Speed = req.Speed
+		}
+		if req.Mode != "" {
+			operation.Mode = req.Mode
+		}
+		if req.TargetTemp > 0 {
+			operation.TargetTemp = req.TargetTemp
 		}
 	}
 
-	if req.Mode != nil && ac.Mode != *req.Mode {
-		ac.Mode = *req.Mode
-		updated = true
+	// 设置环境温度和当前温度
+	operation.EnvironmentTemp = ac.EnvironmentTemp
+	operation.CurrentTemp = ac.EnvironmentTemp // 初始当前温度等于环境温度
+
+	// 保存操作记录
+	if err := database.DB.Create(&operation).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"error": "保存操作记录失败",
+		})
+		return
 	}
 
-	if req.CurrentSpeed != nil && ac.CurrentSpeed != *req.CurrentSpeed {
-		ac.CurrentSpeed = *req.CurrentSpeed
-		updated = true
-	}
-
-	if req.TargetTemp != nil && ac.TargetTemp != *req.TargetTemp {
-		ac.TargetTemp = *req.TargetTemp
-		updated = true
-	}
-
-	if updated {
-		if err := database.DB.Save(&ac).Error; err != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{
-				"error": "更新空调状态失败",
-			})
-			return
-		}
-	}
-
-	// 如果空调开启且有温控需求，添加到调度器
-	if ac.ACState == 1 && ac.TargetTemp != ac.CurrentTemp {
+	// 向调度器发送指令
+	scheduler := GetScheduler()
+	switch req.OperationType {
+	case 0: // 开机
 		acRequest := &ACRequest{
-			RoomID:       roomID,
-			Mode:         ac.Mode,
-			CurrentSpeed: ac.CurrentSpeed,
-			TargetTemp:   ac.TargetTemp,
-			RequestTime:  time.Now(),
+			BillID:        req.BillID,
+			RoomID:        ac.RoomID,
+			ACID:          ac.ID,
+			Mode:          operation.Mode,
+			CurrentSpeed:  operation.Speed,
+			TargetTemp:    operation.TargetTemp,
+			RequestTime:   currentTime,
+			OperationType: req.OperationType,
+		}
+		scheduler.AddRequest(acRequest)
+	case 1: // 关机
+		scheduler.RemoveRequest(ac.RoomID)
+	case 2: // 调温或其他设置
+		// 先移除旧的请求
+		scheduler.RemoveRequest(ac.RoomID)
+		// 添加新的请求
+		acRequest := &ACRequest{
+			BillID:        req.BillID,
+			RoomID:        ac.RoomID,
+			ACID:          ac.ID,
+			Mode:          operation.Mode,
+			CurrentSpeed:  operation.Speed,
+			TargetTemp:    operation.TargetTemp,
+			RequestTime:   currentTime,
+			OperationType: req.OperationType,
 		}
 		scheduler.AddRequest(acRequest)
 	}
-	c.JSON(http.StatusOK, gin.H{
-		"message":         "空调控制成功",
-		"air_conditioner": ac,
-	})
-}
 
-// GetACStatus 获取空调状态
-func GetACStatus(c *gin.Context) {
-	roomIDStr := c.Param("room_id")
-	roomID, err := strconv.Atoi(roomIDStr)
-	if err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{
-			"error": "无效的房间ID",
+	// 获取最新的状态记录用于响应
+	var detail models.AirConditionerDetail
+	if err := database.DB.Where("room_id = ? AND bill_id = ?", ac.RoomID, req.BillID).Order("created_at DESC").First(&detail).Error; err != nil {
+		// 如果没有状态记录，返回操作记录信息
+		c.JSON(http.StatusOK, gin.H{
+			"message": "空调控制成功",
+			"data": map[string]interface{}{
+				"room_id":        ac.RoomID,
+				"bill_id":        req.BillID,
+				"operation_type": req.OperationType,
+				"message":        "操作成功，等待调度器更新状态",
+			},
 		})
 		return
 	}
 
-	// 检查用户是否有权限访问该房间
-	if !checkRoomPermission(c, roomID) {
-		return
-	}
-
-	// 获取空调状态
-	status := getACStatus(roomID)
-
 	c.JSON(http.StatusOK, gin.H{
-		"message": "获取空调状态成功",
-		"status":  status,
+		"message": "空调控制成功",
+		"data":    convertToStatusResponse(detail),
 	})
 }
 
-// GetACStatusLongPolling 长轮询获取空调状态
+// GetACStatusLongPolling HTTP长轮询获取空调状态
 func GetACStatusLongPolling(c *gin.Context) {
-	roomIDStr := c.Param("room_id")
-	roomID, err := strconv.Atoi(roomIDStr)
+	roomID := c.Param("room_id")
+	billIDStr := c.Query("bill_id")
+	billID, err := strconv.Atoi(billIDStr)
 	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{
-			"error": "无效的房间ID",
+			"error": "无效的账单ID",
 		})
 		return
 	}
-
-	// 检查用户是否有权限访问该房间
-	if !checkRoomPermission(c, roomID) {
+	
+	if roomID == "" {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"error": "房间ID不能为空",
+		})
+		return
+	}
+	
+	if billID == 0 {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"error": "订单号不能为空",
+		})
 		return
 	}
 
 	// 获取初始状态
-	initialStatus := getACStatus(roomID)
+	initialStatus := getACCurrentStatus(roomID, billID)
+	if initialStatus == nil {
+		c.JSON(http.StatusNotFound, gin.H{
+			"error": "空调状态不存在",
+		})
+		return
+	}
 
-	// 长轮询逻辑：每5秒检查一次状态变化，最多等待30秒
-	timeout := time.After(3 * time.Second)
+	// 长轮询逻辑：每1秒检查一次状态变化，最多等待10秒
+	timeout := time.After(10 * time.Second)
 	ticker := time.NewTicker(1 * time.Second)
 	defer ticker.Stop()
 
@@ -206,21 +242,24 @@ func GetACStatusLongPolling(c *gin.Context) {
 		select {
 		case <-timeout:
 			// 超时，返回当前状态
+			currentStatus := getACCurrentStatus(roomID, billID)
 			c.JSON(http.StatusOK, gin.H{
 				"message": "获取空调状态成功",
-				"status":  getACStatus(roomID),
+				"data":    currentStatus,
 			})
 			return
+
 		case <-ticker.C:
 			// 检查状态是否有变化
-			currentStatus := getACStatus(roomID)
-			if hasStatusChanged(initialStatus, currentStatus) {
+			currentStatus := getACCurrentStatus(roomID, billID)
+			if currentStatus != nil && hasStatusChanged(*initialStatus, *currentStatus) {
 				c.JSON(http.StatusOK, gin.H{
 					"message": "获取空调状态成功",
-					"status":  currentStatus,
+					"data":    currentStatus,
 				})
 				return
 			}
+
 		case <-c.Request.Context().Done():
 			// 客户端断开连接
 			return
@@ -228,142 +267,59 @@ func GetACStatusLongPolling(c *gin.Context) {
 	}
 }
 
-// GetSchedulerStatus 获取调度器状态（管理员权限）
-func GetSchedulerStatus(c *gin.Context) {
-	// 这里应该检查管理员权限，暂时省略
-
-	scheduler := GetScheduler()
-	servingQueue := scheduler.GetServingQueue()
-	waitingQueue := scheduler.GetWaitingQueue()
-
-	c.JSON(http.StatusOK, gin.H{
-		"message":       "获取调度器状态成功",
-		"serving_queue": servingQueue,
-		"waiting_queue": waitingQueue,
-	})
-}
-
-// GetAllAirConditioners 获取所有空调信息（管理员权限）
-func GetAllAirConditioners(c *gin.Context) {
-	var acs []models.AirConditioner
-	if err := database.DB.Find(&acs).Error; err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{
-			"error": "获取空调信息失败",
-		})
-		return
-	}
-
-	c.JSON(http.StatusOK, gin.H{
-		"message":          "获取所有空调信息成功",
-		"air_conditioners": acs,
-	})
-}
-
-// checkRoomPermission 检查用户是否有权限访问指定房间
-func checkRoomPermission(c *gin.Context, roomID int) bool {
-	userID, exists := c.Get("user_id")
-	if !exists {
-		c.JSON(http.StatusUnauthorized, gin.H{
-			"error": "用户未登录",
-		})
-		return false
-	}
-
-	// 检查用户是否有权限访问该房间
-	var room models.RoomInfo
-	if err := database.DB.Where("room_id = ? AND client_id = ? AND state = ?", roomID, strconv.Itoa(userID.(int)), 1).First(&room).Error; err != nil {
-		c.JSON(http.StatusForbidden, gin.H{
-			"error": "您没有权限访问此房间或房间未入住",
-		})
-		return false
-	}
-
-	return true
-}
-
-// getACStatus 获取空调详细状态
-func getACStatus(roomID int) ACStatusResponse {
-	var ac models.AirConditioner
-	if err := database.DB.Where("room_id = ?", roomID).First(&ac).Error; err != nil {
-		return ACStatusResponse{}
-	}
-
-	// 获取调度器状态
-	scheduler := GetScheduler()
-	servingQueue := scheduler.GetServingQueue()
-	waitingQueue := scheduler.GetWaitingQueue()
-
-	// 检查服务状态
-	serviceStatus := "暂停服务"
-	queuePosition := 0
-	estimatedWaitTime := 0
-
-	if ac.ACState == 1 {
-		// 检查是否在服务队列中
-		for _, req := range servingQueue {
-			if req.RoomID == roomID {
-				serviceStatus = "服务中"
-				break
-			}
+// getACCurrentStatus 获取空调当前状态
+func getACCurrentStatus(roomID string, billID int) *ACStatusResponse {
+	// 获取该房间和订单的最新空调状态记录
+	var detail models.AirConditionerDetail
+	if err := database.DB.Where("room_id = ? AND bill_id = ?", roomID, billID).Order("created_at DESC").First(&detail).Error; err != nil {
+		// 如果没有状态记录，尝试从操作记录获取基础信息
+		var operation models.AirConditionerOperation
+		if err := database.DB.Where("room_id = ? AND bill_id = ?", roomID, billID).Order("created_at DESC").First(&operation).Error; err != nil {
+			return nil
 		}
-
-		// 如果不在服务队列，检查等待队列
-		if serviceStatus == "暂停服务" {
-			for i, req := range waitingQueue {
-				if req.RoomID == roomID {
-					serviceStatus = "等待服务"
-					queuePosition = i + 1
-					// 估算等待时间：前面每个请求2分钟 + 当前服务队列剩余时间
-					estimatedWaitTime = (i + 1) * 2
-					break
-				}
-			}
+		
+		// 根据操作记录构造状态响应
+		roomIDInt, _ := strconv.Atoi(roomID)
+		return &ACStatusResponse{
+			RoomID:          roomIDInt,
+			ACStatus:        operation.OperationState, // 使用操作状态
+			Speed:           operation.Speed,
+			Mode:            operation.Mode,
+			TargetTemp:      operation.TargetTemp,
+			EnvironmentTemp: operation.EnvironmentTemp,
+			CurrentTemp:     operation.CurrentTemp,
+			CurrentCost:     operation.CurrentCost,
+			TotalCost:       operation.TotalCost,
+			Rate:            1.0,
 		}
-	} else {
-		serviceStatus = "已关机"
 	}
 
-	// 计算费用
-	totalCost := calculateTotalCost(roomID)
-	sessionCost := calculateSessionCost(roomID, ac.LastPowerOnTime)
+	return convertToStatusResponse(detail)
+}
 
-	return ACStatusResponse{
-		ServiceStatus:     serviceStatus,
-		CurrentTemp:       ac.CurrentTemp, // 直接返回存储的整数温度值
-		TargetTemp:        ac.TargetTemp,  // 直接返回存储的整数温度值
-		CurrentSpeed:      ac.CurrentSpeed,
-		TotalCost:         totalCost,
-		SessionCost:       sessionCost,
-		ACState:           ac.ACState,
-		Mode:              ac.Mode,
-		QueuePosition:     queuePosition,
-		EstimatedWaitTime: estimatedWaitTime,
+// convertToStatusResponse 转换为状态响应格式
+func convertToStatusResponse(detail models.AirConditionerDetail) *ACStatusResponse {
+	return &ACStatusResponse{
+		RoomID:          detail.RoomID,
+		ACStatus:        detail.ACStatus,
+		Speed:           detail.Speed,
+		Mode:            detail.Mode,
+		TargetTemp:      detail.TargetTemp,
+		EnvironmentTemp: detail.EnvironmentTemp,
+		CurrentTemp:     detail.CurrentTemp,
+		CurrentCost:     detail.CurrentCost,
+		TotalCost:       detail.TotalCost,
+		Rate:            detail.Rate,
 	}
 }
 
 // hasStatusChanged 检查状态是否发生变化
 func hasStatusChanged(oldStatus, newStatus ACStatusResponse) bool {
-	return oldStatus.ServiceStatus != newStatus.ServiceStatus ||
+	return oldStatus.ACStatus != newStatus.ACStatus ||
 		oldStatus.CurrentTemp != newStatus.CurrentTemp ||
-		oldStatus.QueuePosition != newStatus.QueuePosition ||
-		oldStatus.EstimatedWaitTime != newStatus.EstimatedWaitTime ||
-		oldStatus.ACState != newStatus.ACState
-}
-
-// calculateTotalCost 计算累计总费用
-func calculateTotalCost(roomID int) float32 {
-	var totalCost float32
-	database.DB.Model(&models.Detail{}).Where("room_id = ?", roomID).Select("COALESCE(SUM(cost), 0)").Scan(&totalCost)
-	return totalCost
-}
-
-// calculateSessionCost 计算本次开机费用
-func calculateSessionCost(roomID int, lastPowerOnTime time.Time) float32 {
-	if lastPowerOnTime.IsZero() {
-		return 0
-	}
-
-	var sessionCost float32
-	database.DB.Model(&models.Detail{}).Where("room_id = ? AND start_time >= ?", roomID, lastPowerOnTime).Select("COALESCE(SUM(cost), 0)").Scan(&sessionCost)
-	return sessionCost
+		oldStatus.CurrentCost != newStatus.CurrentCost ||
+		oldStatus.TotalCost != newStatus.TotalCost ||
+		oldStatus.Speed != newStatus.Speed ||
+		oldStatus.Mode != newStatus.Mode ||
+		oldStatus.TargetTemp != newStatus.TargetTemp
 }

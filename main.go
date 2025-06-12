@@ -22,7 +22,8 @@ func main() {
 	}
 
 	// 设置Gin模式
-	gin.SetMode(gin.ReleaseMode)
+	gin.SetMode(gin.DebugMode)
+	// gin.SetMode(gin.ReleaseMode)
 
 	// 创建Gin路由器
 	r := gin.Default()
@@ -75,7 +76,7 @@ func main() {
 			// 空调相关路由
 			ac := auth.Group("/airconditioner")
 			{
-				ac.GET("/:room_id", handlers.GetAirConditioner)             // 获取房间空调信息
+
 				ac.PUT("/:room_id", handlers.ControlAirConditioner)         // 控制空调
 				ac.GET("/:room_id/status", handlers.GetACStatusLongPolling) // 长轮询获取空调状态
 			}
@@ -85,29 +86,29 @@ func main() {
 		admin := api.Group("/admin")
 		admin.Use(middleware.AuthMiddleware(), middleware.AdminMiddleware())
 		{
-			admin.GET("/rooms", handlers.GetAllRooms)                     // 获取所有房间
-			admin.GET("/airconditioners", handlers.GetAllAirConditioners) // 获取所有空调信息
-			admin.GET("/scheduler/status", handlers.GetSchedulerStatus)   // 获取调度器状态
-			admin.PUT("/room-types/:id", handlers.UpdateRoomType)         // 修改指定ID的房间类型
+			admin.GET("/rooms", handlers.GetAllRooms) // 获取所有房间
+			// admin.GET("/airconditioners", handlers.GetAllAirConditioners) // 获取所有空调信息
+			// admin.GET("/scheduler/status", handlers.GetSchedulerStatus)   // 获取调度器状态
+			admin.PUT("/room-types/:id", handlers.UpdateRoomType) // 修改指定ID的房间类型
 		}
 	}
 
 	// 启动服务器
 	log.Printf("服务器启动在端口 %s", config.ServerPort)
 	log.Printf("健康检查: http://localhost%s/health", config.ServerPort)
-	log.Printf("API文档:")
-	log.Printf("  POST /api/public/register - 用户注册")
-	log.Printf("  POST /api/public/login - 用户登录")
-	log.Printf("  GET  /api/auth/rooms/available - 获取空房间")
-	log.Printf("  GET  /api/auth/rooms/my - 获取我的房间")
-	log.Printf("  POST /api/auth/rooms/book - 订房")
-	log.Printf("  DELETE /api/auth/rooms/:room_id/checkout - 退房")
-	log.Printf("  GET  /api/auth/airconditioner/:room_id - 获取空调信息")
-	log.Printf("  PUT  /api/auth/airconditioner/:room_id - 控制空调")
-	log.Printf("  GET  /api/auth/airconditioner/:room_id/status - 长轮询获取空调状态")
-	log.Printf("  GET  /api/admin/rooms - 获取所有房间(管理员)")
-	log.Printf("  GET  /api/admin/airconditioners - 获取所有空调(管理员)")
-	log.Printf("  GET  /api/admin/scheduler/status - 获取空调调度器状态(管理员)")
+	// log.Printf("API文档:")
+	// log.Printf("  POST /api/public/register - 用户注册")
+	// log.Printf("  POST /api/public/login - 用户登录")
+	// log.Printf("  GET  /api/auth/rooms/available - 获取空房间")
+	// log.Printf("  GET  /api/auth/rooms/my - 获取我的房间")
+	// log.Printf("  POST /api/auth/rooms/book - 订房")
+	// log.Printf("  DELETE /api/auth/rooms/:room_id/checkout - 退房")
+	// log.Printf("  GET  /api/auth/airconditioner/:room_id - 获取空调信息")
+	// log.Printf("  PUT  /api/auth/airconditioner/:room_id - 控制空调")
+	// log.Printf("  GET  /api/auth/airconditioner/:room_id/status - 长轮询获取空调状态")
+	// log.Printf("  GET  /api/admin/rooms - 获取所有房间(管理员)")
+	// log.Printf("  GET  /api/admin/airconditioners - 获取所有空调(管理员)")
+	// log.Printf("  GET  /api/admin/scheduler/status - 获取空调调度器状态(管理员)")
 
 	if err := r.Run(config.ServerPort); err != nil {
 		log.Fatal("服务器启动失败:", err)
