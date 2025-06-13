@@ -2,7 +2,9 @@ package handlers
 
 import (
 	"fmt"
+	"log"
 	"net/http"
+	"os"
 	"strconv"
 	"time"
 
@@ -229,19 +231,34 @@ func CheckoutRoom(c *gin.Context) {
 		return
 	}
 
-	// 设置响应头并返回Excel文件
+	// 保存Excel文件到本地
 	filename := fmt.Sprintf("空调使用详单_%d_%d.xlsx", checkinOperation.BillID, roomID)
-	c.Header("Content-Type", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
-	c.Header("Content-Disposition", fmt.Sprintf("attachment; filename=%s", filename))
-	c.Header("Content-Transfer-Encoding", "binary")
+	filePath := fmt.Sprintf("./reports/%s", filename)
 
-	// 将Excel文件写入响应
-	if err := excelFile.Write(c.Writer); err != nil {
+	// 确保reports目录存在
+	os.MkdirAll("./reports", 0755)
+
+	// 保存Excel文件到本地
+	if err := excelFile.SaveAs(filePath); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{
-			"error": "下载文件失败",
+			"error": "保存空调使用报告失败: " + err.Error(),
 		})
 		return
 	}
+
+	// 返回成功响应
+	c.JSON(http.StatusOK, gin.H{
+		"message": "退房成功",
+		"data": gin.H{
+			"room_id":        roomID,
+			"bill_id":        billID,
+			"actual_cost":    actualCost,
+			"actual_days":    actualDays,
+			"checkout_time":  checkoutTime,
+			"report_file":    filePath,
+			"ac_operations":  acOperations,
+		},
+	})
 }
 
 // generateACReportExcel 生成空调使用报告Excel文件
@@ -252,6 +269,13 @@ func generateACReportExcel(billID int, roomID int, acOperations []models.AirCond
 			fmt.Println(err)
 		}
 	}()
+
+	// 通过账单号查询空调详细记录数据
+	var acDetails []models.AirConditionerDetail
+	if err := database.DB.Where("bill_id = ?", billID).Order("created_at ASC").Find(&acDetails).Error; err != nil {
+		log.Printf("查询空调详细记录失败: %v", err)
+		// 如果查询失败，继续生成报告但不包含详细记录
+	}
 
 	// 设置工作表名称
 	sheetName := "空调使用详单"
@@ -310,10 +334,44 @@ func generateACReportExcel(billID int, roomID int, acOperations []models.AirCond
 	f.SetCellValue(sheetName, fmt.Sprintf("D%d", row), "目标温度")
 	f.SetCellValue(sheetName, fmt.Sprintf("E%d", row), "风速")
 	f.SetCellValue(sheetName, fmt.Sprintf("F%d", row), "模式")
-
 	f.SetCellValue(sheetName, fmt.Sprintf("G%d", row), "当前费用")
 	f.SetCellValue(sheetName, fmt.Sprintf("H%d", row), "总费用")
+	f.SetCellValue(sheetName, fmt.Sprintf("I%d", row), "运行时间")
+	f.SetCellValue(sheetName, fmt.Sprintf("J%d", row), "空调状态")
 	row++
+
+	// 填充空调详细记录数据
+	for i, detail := range acDetails {
+		f.SetCellValue(sheetName, fmt.Sprintf("A%d", row), i+1)
+		f.SetCellValue(sheetName, fmt.Sprintf("B%d", row), detail.CreatedAt.Format("2006-01-02 15:04:05"))
+		// 当前温度除以10显示实际温度
+		f.SetCellValue(sheetName, fmt.Sprintf("C%d", row), float32(detail.CurrentTemp)/10.0)
+		// 目标温度除以10显示实际温度
+		f.SetCellValue(sheetName, fmt.Sprintf("D%d", row), float32(detail.TargetTemp)/10.0)
+		f.SetCellValue(sheetName, fmt.Sprintf("E%d", row), detail.Speed)
+		f.SetCellValue(sheetName, fmt.Sprintf("F%d", row), detail.Mode)
+		f.SetCellValue(sheetName, fmt.Sprintf("G%d", row), detail.CurrentCost)
+		f.SetCellValue(sheetName, fmt.Sprintf("H%d", row), detail.TotalCost)
+		f.SetCellValue(sheetName, fmt.Sprintf("I%d", row), detail.RunningTime)
+
+		// 将空调状态数字转换为中文描述
+		var statusDesc string
+		switch detail.ACStatus {
+		case 0:
+			statusDesc = "运行"
+		case 1:
+			statusDesc = "在等待序列"
+		case 2:
+			statusDesc = "关机回温"
+		case 3:
+			statusDesc = "达到目标温度回温"
+		default:
+			statusDesc = "未知"
+		}
+		f.SetCellValue(sheetName, fmt.Sprintf("J%d", row), statusDesc)
+
+		row++
+	}
 
 	// 添加汇总信息
 	row += 2
@@ -321,11 +379,13 @@ func generateACReportExcel(billID int, roomID int, acOperations []models.AirCond
 	row++
 	f.SetCellValue(sheetName, fmt.Sprintf("A%d", row), fmt.Sprintf("总操作次数: %d", len(acOperations)))
 	row++
+	f.SetCellValue(sheetName, fmt.Sprintf("A%d", row), fmt.Sprintf("详细记录条数: %d", len(acDetails)))
+	row++
 
 	// 设置列宽
 	f.SetColWidth(sheetName, "A", "A", 8)
 	f.SetColWidth(sheetName, "B", "B", 20)
-	f.SetColWidth(sheetName, "C", "I", 12)
+	f.SetColWidth(sheetName, "C", "J", 12)
 
 	return f, nil
 }

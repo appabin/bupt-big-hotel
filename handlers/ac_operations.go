@@ -20,16 +20,17 @@ type ACControlRequest struct {
 
 // ACStatusResponse 空调状态响应结构
 type ACStatusResponse struct {
-	RoomID          int     `json:"room_id"`
-	ACStatus        int     `json:"ac_status"`        // 0: 运行 1: 暂停服务 2: 停机
-	Speed           string  `json:"speed"`            // 风速：high/medium/low
-	Mode            string  `json:"mode"`             // 模式：cooling/heating
-	TargetTemp      int     `json:"target_temp"`      // 目标温度*10
-	EnvironmentTemp int     `json:"environment_temp"` // 环境温度*10
-	CurrentTemp     int     `json:"current_temp"`     // 当前温度*10
-	CurrentCost     float32 `json:"current_cost"`     // 当前花费金额
-	TotalCost       float32 `json:"total_cost"`       // 总花费金额
-	Rate            float32 `json:"rate"`             // 每分钟费率(元/分钟)
+	RoomID             int     `json:"room_id"`
+	ACStatus           int     `json:"ac_status"`            // 0: 运行 1: 暂停服务 2: 停机
+	Speed              string  `json:"speed"`                // 风速：high/medium/low
+	Mode               string  `json:"mode"`                 // 模式：cooling/heating
+	TargetTemp         int     `json:"target_temp"`          // 目标温度*10
+	EnvironmentTemp    int     `json:"environment_temp"`     // 环境温度*10
+	CurrentTemp        int     `json:"current_temp"`         // 当前温度*10
+	CurrentCost        float32 `json:"current_cost"`         // 当前花费金额
+	TotalCost          float32 `json:"total_cost"`           // 总花费金额
+	CurrentRunningTime int     `json:"current_running_time"` // 当前运行时间(秒)
+	RunningTime        int     `json:"running_time"`         // 运行时间(秒)
 }
 
 // ControlAirConditioner 控制空调
@@ -224,25 +225,26 @@ func ControlAirConditioner(c *gin.Context) {
 // GetACStatusLongPolling HTTP长轮询获取空调状态
 func GetACStatusLongPolling(c *gin.Context) {
 	roomID := c.Param("room_id")
-	billIDStr := c.Query("bill_id")
-	billID, err := strconv.Atoi(billIDStr)
-	if err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{
-			"error": "无效的账单ID",
-		})
-		return
-	}
-
 	if roomID == "" {
 		c.JSON(http.StatusBadRequest, gin.H{
 			"error": "房间ID不能为空",
 		})
 		return
 	}
+	// 从房间操作表中获取当前房间的有效订单号
+	var roomOperation models.RoomOperation
+	if err := database.DB.Where("room_id = ? AND operation_type = ?", roomID, "checkin").Order("operation_time DESC").First(&roomOperation).Error; err != nil {
+		c.JSON(http.StatusNotFound, gin.H{
+			"error": "该房间没有有效的入住记录，无法获取空调状态",
+		})
+		return
+	}
 
+	// 使用从房间操作表获取的订单号
+	billID := roomOperation.BillID
 	if billID == 0 {
 		c.JSON(http.StatusBadRequest, gin.H{
-			"error": "订单号不能为空",
+			"error": "房间操作记录中订单号无效",
 		})
 		return
 	}
@@ -304,16 +306,17 @@ func getACCurrentStatus(roomID string, billID int) *ACStatusResponse {
 		// 根据操作记录构造状态响应
 		roomIDInt, _ := strconv.Atoi(roomID)
 		return &ACStatusResponse{
-			RoomID:          roomIDInt,
-			ACStatus:        operation.OperationState, // 使用操作状态
-			Speed:           operation.Speed,
-			Mode:            operation.Mode,
-			TargetTemp:      operation.TargetTemp,
-			EnvironmentTemp: operation.EnvironmentTemp,
-			CurrentTemp:     operation.CurrentTemp,
-			CurrentCost:     operation.CurrentCost,
-			TotalCost:       operation.TotalCost,
-			Rate:            1.0,
+			RoomID:             roomIDInt,
+			ACStatus:           operation.OperationState, // 使用操作状态
+			Speed:              operation.Speed,
+			Mode:               operation.Mode,
+			TargetTemp:         operation.TargetTemp,
+			EnvironmentTemp:    operation.EnvironmentTemp,
+			CurrentTemp:        operation.CurrentTemp,
+			CurrentCost:        operation.CurrentCost,
+			CurrentRunningTime: operation.CurrentRunningTime,
+			RunningTime:        operation.RunningTime,
+			TotalCost:          operation.TotalCost,
 		}
 	}
 
@@ -337,16 +340,17 @@ func getACStatusFromOperation(operationType int) int {
 // convertToStatusResponse 转换为状态响应格式
 func convertToStatusResponse(detail models.AirConditionerDetail) *ACStatusResponse {
 	return &ACStatusResponse{
-		RoomID:          detail.RoomID,
-		ACStatus:        detail.ACStatus,
-		Speed:           detail.Speed,
-		Mode:            detail.Mode,
-		TargetTemp:      detail.TargetTemp,
-		EnvironmentTemp: detail.EnvironmentTemp,
-		CurrentTemp:     detail.CurrentTemp,
-		CurrentCost:     detail.CurrentCost,
-		TotalCost:       detail.TotalCost,
-		Rate:            detail.Rate,
+		RoomID:             detail.RoomID,
+		ACStatus:           detail.ACStatus,
+		Speed:              detail.Speed,
+		Mode:               detail.Mode,
+		TargetTemp:         detail.TargetTemp,
+		EnvironmentTemp:    detail.EnvironmentTemp,
+		CurrentTemp:        detail.CurrentTemp,
+		CurrentCost:        detail.CurrentCost,
+		TotalCost:          detail.TotalCost,
+		CurrentRunningTime: detail.CurrentRunningTime,
+		RunningTime:        detail.RunningTime,
 	}
 }
 
@@ -358,5 +362,7 @@ func hasStatusChanged(oldStatus, newStatus ACStatusResponse) bool {
 		oldStatus.TotalCost != newStatus.TotalCost ||
 		oldStatus.Speed != newStatus.Speed ||
 		oldStatus.Mode != newStatus.Mode ||
-		oldStatus.TargetTemp != newStatus.TargetTemp
+		oldStatus.TargetTemp != newStatus.TargetTemp ||
+		oldStatus.CurrentRunningTime != newStatus.CurrentRunningTime ||
+		oldStatus.RunningTime != newStatus.RunningTime
 }

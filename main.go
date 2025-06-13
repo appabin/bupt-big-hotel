@@ -22,9 +22,6 @@ func main() {
 	}
 
 	// 启动全局调度器
-	scheduler := handlers.GetScheduler()
-	go scheduler.StartScheduler()
-	log.Println("全局空调调度器已启动")
 
 	// 设置Gin模式
 	gin.SetMode(gin.DebugMode)
@@ -92,9 +89,10 @@ func main() {
 		admin.Use(middleware.AuthMiddleware(), middleware.AdminMiddleware())
 		{
 			admin.GET("/rooms", handlers.GetAllRooms) // 获取所有房间
-		// admin.GET("/airconditioners", handlers.GetAllAirConditioners) // 获取所有空调信息
-		admin.GET("/scheduler/status", handlers.GetSchedulerStatus)   // 获取调度器状态
-		admin.PUT("/room-types/:id", handlers.UpdateRoomType) // 修改指定ID的房间类型
+			// admin.GET("/airconditioners", handlers.GetAllAirConditioners) // 获取所有空调信息
+			admin.GET("/scheduler/status", handlers.GetSchedulerStatus) // 获取调度器状态
+			admin.PUT("/room-types/:id", handlers.UpdateRoomType)       // 修改指定ID的房间类型
+			admin.GET("/scheduler", handlers.GetAdminSchedulerStatus)
 		}
 	}
 
