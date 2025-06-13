@@ -26,6 +26,7 @@ func InitDatabase(databasePath string) error {
 		&models.AirConditioner{},
 		&models.AirConditionerDetail{},
 		&models.RoomOperation{},
+		&models.AirConditionerOperation{},
 	)
 	if err != nil {
 		return err

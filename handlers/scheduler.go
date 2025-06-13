@@ -3,637 +3,701 @@ package handlers
 import (
 	"bupt-hotel/database"
 	"bupt-hotel/models"
-	"fmt"
 	"log"
+	"sort"
 	"sync"
 	"time"
+
+	"github.com/gin-gonic/gin"
 )
 
-// ACRequest 空调请求结构
-type ACRequest struct {
-	BillID        int
-	RoomID        int
-	ACID          int
-	ACState       int //0-运行 1-暂停服务 2-停机
-	Mode          string
-	CurrentSpeed  string
-	TargetTemp    int
-	RequestTime   time.Time
-	StartTime     time.Time
-	Priority      int // 1: high, 2: medium, 3: low
-	OperationType int // 0: 开机, 1: 关机, 2: 调温
-}
-
-// ACScheduler 空调调度器
+// ACScheduler 空调调度器框架
 type ACScheduler struct {
 	mu           sync.RWMutex
-	servingQueue []*ACRequest // 正在服务的队列（最多3个）
-	waitingQueue []*ACRequest // 等待队列
-	ticker       *time.Ticker
-	stopChan     chan bool
-	warmBackMap  map[int]*ACRequest // 回温程序中的空调
+	schedulers   map[int]*models.Scheduler // ACID -> Scheduler
+	servingQueue []*models.Scheduler       // 当前服务队列
+	bufferQueue  []*models.Scheduler       // 缓冲队列
+	warmingQueue []*models.Scheduler       // 回温队列
+
+	isRunning bool         // 调度器是否正在运行
+	stopChan  chan bool    // 停止信号
+	ticker    *time.Ticker // 定时器
+
+	// 新增时间片相关属性
+	tickCount       int  // 当前tick计数
+	currentPriority int  // 当前时间片调度优先级，初始为0
+	firstACAdded    bool // 是否已添加第一个空调
 }
 
-// 全局调度器
 var (
-	scheduler *ACScheduler
-	once      sync.Once
+	schedulerInstance *ACScheduler
+	schedulerOnce     sync.Once
 )
 
 // GetScheduler 获取调度器单例
 func GetScheduler() *ACScheduler {
-	once.Do(func() {
-		scheduler = &ACScheduler{
-			servingQueue: make([]*ACRequest, 0, 3),
-			waitingQueue: make([]*ACRequest, 0),
-			ticker:       time.NewTicker(6 * time.Second), // 每6秒检查一次
-			stopChan:     make(chan bool),
-			warmBackMap:  make(map[int]*ACRequest),
+	schedulerOnce.Do(func() {
+		schedulerInstance = &ACScheduler{
+			schedulers:      make(map[int]*models.Scheduler),
+			servingQueue:    make([]*models.Scheduler, 0),
+			bufferQueue:     make([]*models.Scheduler, 0),
+			warmingQueue:    make([]*models.Scheduler, 0),
+			isRunning:       false,
+			stopChan:        make(chan bool),
+			tickCount:       0,
+			currentPriority: 0,
+			firstACAdded:    false,
 		}
-		go scheduler.run()
 	})
-	return scheduler
+	return schedulerInstance
 }
 
-// 调度器运行逻辑
-func (s *ACScheduler) run() {
-	scheduleCounter := 0
+// AddRequest 添加调度请求
+func (s *ACScheduler) AddRequest(scheduler *models.Scheduler) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	// 添加到调度器映射
+	s.schedulers[scheduler.ACID] = scheduler
+
+	// 如果是第一个空调，直接加入服务队列并启动调度器
+	if !s.firstACAdded {
+		s.servingQueue = append(s.servingQueue, scheduler)
+		s.bufferQueue = append(s.bufferQueue, scheduler)
+		s.firstACAdded = true
+		if !s.isRunning {
+			go s.StartScheduler()
+		}
+		log.Printf("第一个空调加入服务队列: 空调ID %d", scheduler.ACID)
+	} else {
+		// 后续空调加入缓冲队列
+		s.bufferQueue = append(s.bufferQueue, scheduler)
+		log.Printf("空调加入缓冲队列: 空调ID %d", scheduler.ACID)
+	}
+}
+
+// UpdateACInBuffer 更新队列中的空调参数
+func (s *ACScheduler) UpdateACInBuffer(acID int, targetTemp int, speed string, priority int) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	// 在缓冲队列中查找对应的空调
+	for _, scheduler := range s.bufferQueue {
+		if scheduler.ACID == acID {
+			// 更新目标温度和风速
+			scheduler.TargetTemp = targetTemp
+			scheduler.CurrentSpeed = speed
+			scheduler.Priority = priority
+			log.Printf("调温操作：更新缓冲队列中空调ID %d 的目标温度为 %d°C，风速为 %s", acID, targetTemp, speed)
+			return true
+		}
+	}
+
+	// 在回温队列中查找对应的空调
+	for _, scheduler := range s.warmingQueue {
+		if scheduler.ACID == acID {
+			// 更新目标温度和风速
+			scheduler.TargetTemp = targetTemp
+			scheduler.CurrentSpeed = speed
+			scheduler.Priority = priority
+			log.Printf("调温操作：更新回温队列中空调ID %d 的目标温度为 %d°C，风速为 %s", acID, targetTemp, speed)
+			return true
+		}
+	}
+
+	return false
+}
+
+// RemoveRequest 移除调度请求
+func (s *ACScheduler) RemoveRequest(acID int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	// 在缓冲队列中查找
+	for _, scheduler := range s.bufferQueue {
+		if scheduler.ACID == acID {
+			scheduler.ACState = 2
+			log.Printf("空调ID %d 在缓冲队列中找到，状态设置为2（关机回温）", acID)
+			return
+		}
+	}
+
+	// 在回温队列中查找
+	for _, scheduler := range s.warmingQueue {
+		if scheduler.ACID == acID {
+			scheduler.ACState = 2
+			log.Printf("空调ID %d 在回温队列中找到，状态设置为2（关机回温）", acID)
+			return
+		}
+	}
+
+	log.Printf("未找到空调ID %d", acID)
+}
+
+// StartScheduler 启动调度器
+func (s *ACScheduler) StartScheduler() {
+	s.mu.Lock()
+	if s.isRunning {
+		s.mu.Unlock()
+		return
+	}
+	s.isRunning = true
+	s.ticker = time.NewTicker(3 * time.Second) // 每6秒执行一次（trick值为6）
+	s.mu.Unlock()
+
+	log.Println("空调调度器已启动，tick间隔为6秒")
+
 	for {
 		select {
 		case <-s.ticker.C:
-			s.updateTemperatures()
-			s.logQueueStatus()
-			scheduleCounter++
-			// 每分钟进行一次调度（10次6秒 = 60秒）
-			if scheduleCounter >= 10 {
-				s.checkTimeSlices()
-				s.scheduleNext()
-				scheduleCounter = 0
-			}
+			s.scheduleAirConditioners()
 		case <-s.stopChan:
+			log.Println("空调调度器已停止")
 			return
 		}
+
 	}
 }
 
-// 输出队列状态日志
-func (s *ACScheduler) logQueueStatus() {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-
-	// 构建服务队列信息
-	servingInfo := make([]string, 0)
-	for _, req := range s.servingQueue {
-		serviceTime := time.Since(req.StartTime).Minutes()
-		// 获取当前房间温度和费用
-		currentTemp := "未知"
-		totalCost := float32(0)
-		
-		// 从最新的状态记录获取当前温度
-		var lastDetail models.AirConditionerDetail
-		if err := database.DB.Where("room_id = ? AND bill_id = ?", req.RoomID, req.BillID).Order("created_at DESC").First(&lastDetail).Error; err == nil {
-			currentTemp = fmt.Sprintf("%.1f°C", float32(lastDetail.CurrentTemp)/10.0)
-		}
-		// 获取总费用
-		database.DB.Model(&models.AirConditionerDetail{}).Where("room_id = ? AND bill_id = ?", req.RoomID, req.BillID).Select("COALESCE(SUM(current_cost), 0)").Scan(&totalCost)
-		servingInfo = append(servingInfo, fmt.Sprintf("房间%d(订单%d,优先级%d,已服务%.1f分钟,当前温度%s,已花费%.2f元)", req.RoomID, req.BillID, req.Priority, serviceTime, currentTemp, totalCost))
-	}
-
-	// 构建等待队列信息
-	waitingInfo := make([]string, 0)
-	for i, req := range s.waitingQueue {
-		waitTime := time.Since(req.RequestTime).Minutes()
-		// 获取当前房间温度和费用
-		currentTemp := "未知"
-		totalCost := float32(0)
-		
-		// 从最新的状态记录获取当前温度
-		var lastDetail models.AirConditionerDetail
-		if err := database.DB.Where("room_id = ? AND bill_id = ?", req.RoomID, req.BillID).Order("created_at DESC").First(&lastDetail).Error; err == nil {
-			currentTemp = fmt.Sprintf("%.1f°C", float32(lastDetail.CurrentTemp)/10.0)
-		}
-		// 获取总费用
-		database.DB.Model(&models.AirConditionerDetail{}).Where("room_id = ? AND bill_id = ?", req.RoomID, req.BillID).Select("COALESCE(SUM(current_cost), 0)").Scan(&totalCost)
-		waitingInfo = append(waitingInfo, fmt.Sprintf("房间%d(订单%d,优先级%d,等待%.1f分钟,位置%d,当前温度%s,已花费%.2f元)", req.RoomID, req.BillID, req.Priority, waitTime, i+1, currentTemp, totalCost))
-	}
-
-	// 输出日志
-	if len(servingInfo) == 0 && len(waitingInfo) == 0 {
-		log.Printf("[调度器状态] 服务队列: 空, 等待队列: 空")
-	} else {
-		servingStr := "空"
-		if len(servingInfo) > 0 {
-			servingStr = fmt.Sprintf("%v", servingInfo)
-		}
-		waitingStr := "空"
-		if len(waitingInfo) > 0 {
-			waitingStr = fmt.Sprintf("%v", waitingInfo)
-		}
-		log.Printf("[调度器状态] 服务队列(%d): %s, 等待队列(%d): %s", len(s.servingQueue), servingStr, len(s.waitingQueue), waitingStr)
-	}
-}
-
-// 更新所有空调温度
-func (s *ACScheduler) updateTemperatures() {
+// scheduleAirConditioners 执行刷新操作
+func (s *ACScheduler) scheduleAirConditioners() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	// 更新正在服务的空调温度
-	for _, req := range s.servingQueue {
-		s.updateACTemperature(req)
+	// 增加tick计数
+	s.tickCount++
+
+	// 每个tick都刷新当前温度并输出日志
+	s.refreshTemperature()
+
+	// 刷新回温队列
+	s.refreshWarmingQueue()
+
+	// 检查是否需要进行排序（每10个tick的第9个tick，即10*n-1）
+	if s.tickCount%10 == 9 {
+
+		log.Printf("第%d个tick，开始对缓冲队列进行刷新和排序", s.tickCount+1)
+		s.UpdateBufferQueue()
+		s.updateWarmingQueue()
+		s.sortBufferQueue()
+		s.updateServingQueue()
 	}
 
-	// 更新所有关机空调的回温
-	s.updateOfflineTemperatures()
+	// 记录当前状态
+	log.Printf("Tick %d - 服务队列: %d, 缓冲队列: %d, 回温队列: %d, 总请求: %d",
+		s.tickCount, len(s.servingQueue), len(s.bufferQueue), len(s.warmingQueue), len(s.schedulers))
 
-	// 更新回温程序中的空调
-	s.updateWarmBackTemperatures()
+	// 在刷新操作结束后保存空调状态到数据库
+	s.saveACStatesToDB()
+
 }
 
-// 更新单个空调温度
-func (s *ACScheduler) updateACTemperature(req *ACRequest) {
-	// 获取空调基础信息
-	var ac models.AirConditioner
-	if err := database.DB.Where("room_id = ?", req.RoomID).First(&ac).Error; err != nil {
-		return
-	}
-
-	// 获取最新的操作记录
-	var operation models.AirConditionerOperation
-	if err := database.DB.Where("room_id = ? AND bill_id = ?", req.RoomID, req.BillID).Order("created_at DESC").First(&operation).Error; err != nil {
-		return
-	}
-
-	// 如果是关机状态，不进行温度更新
-	if operation.OperationState == 1 {
-		return
-	}
-
-	// 计算温度变化 - 每6秒刷新一次
-	var tempChange int
-	serviceSeconds := time.Since(req.StartTime).Seconds()
-
-	// 根据风速计算温度变化
-	switch req.CurrentSpeed {
-	case "high":
-		// 高风：每分钟1度，每6秒0.1度
-		tempChange = 1
-	case "medium":
-		// 中风：每2分钟1度，每12秒0.1度
-		if int(serviceSeconds)%12 == 0 && serviceSeconds >= 12 {
-			tempChange = 1
-		}
-	case "low":
-		// 低风：每3分钟1度，每18秒0.1度
-		if int(serviceSeconds)%18 == 0 && serviceSeconds >= 18 {
-			tempChange = 1
-		}
-	}
-
-	// 获取当前温度（从最新的状态记录或操作记录）
-	currentTemp := operation.CurrentTemp
-	var lastDetail models.AirConditionerDetail
-	if err := database.DB.Where("room_id = ? AND bill_id = ?", req.RoomID, req.BillID).Order("created_at DESC").First(&lastDetail).Error; err == nil {
-		currentTemp = lastDetail.CurrentTemp
-	}
-
-	// 根据模式调整温度
-	if tempChange > 0 {
-		oldTemp := currentTemp
-		newTemp := currentTemp
-		
-		if req.Mode == "cooling" {
-			if currentTemp > req.TargetTemp {
-				newTemp = currentTemp - tempChange
-				if newTemp <= req.TargetTemp {
-					newTemp = req.TargetTemp
-					// 达到目标温度，进入回温模式
-					s.startWarmBack(req)
-				}
-			}
-		} else if req.Mode == "heating" {
-			if currentTemp < req.TargetTemp {
-				newTemp = currentTemp + tempChange
-				if newTemp >= req.TargetTemp {
-					newTemp = req.TargetTemp
-					// 达到目标温度，进入回温模式
-					s.startWarmBack(req)
-				}
-			}
-		}
-
-		// 计算费用：温度变化量等于消费金额
-		actualTempChange := abs(newTemp - oldTemp)
-		if actualTempChange > 0 {
-			// 每变化0.1度收费0.1元
-			cost := float32(actualTempChange) / 10.0
-
-			// 获取总费用
-			var totalCost float32
-			database.DB.Model(&models.AirConditionerDetail{}).Where("room_id = ? AND bill_id = ?", req.RoomID, req.BillID).Select("COALESCE(SUM(current_cost), 0)").Scan(&totalCost)
-			totalCost += cost
-
-			// 创建状态记录
-			detail := models.AirConditionerDetail{
-				BillID:          req.BillID,
-				RoomID:          req.RoomID,
-				AcID:            req.ACID,
-				OperationType:   0, // 系统自动记录
-				ACStatus:        0, // 运行状态
-				Speed:           req.CurrentSpeed,
-				Mode:            req.Mode,
-				TargetTemp:      req.TargetTemp,
-				EnvironmentTemp: ac.EnvironmentTemp,
-				CurrentTemp:     newTemp,
-				CurrentCost:     cost,
-				TotalCost:       totalCost,
-				QueryTime:       time.Now(),
-				StartTime:       req.StartTime,
-				EndTime:         time.Now(),
-				ServeTime:       float32(time.Since(req.StartTime).Seconds()) / 60.0,
-				QueueWaitTime:   0,
-				Rate:            1.0,
-				TempChange:      actualTempChange,
-			}
-			database.DB.Create(&detail)
-		}
-	}
-}
-
-// abs 返回整数的绝对值
-func abs(x int) int {
-	if x < 0 {
-		return -x
-	}
-	return x
-}
-
-// 开始回温程序
-func (s *ACScheduler) startWarmBack(req *ACRequest) {
-	// 从服务队列中移除
-	for i, r := range s.servingQueue {
-		if r.RoomID == req.RoomID {
-			s.servingQueue = append(s.servingQueue[:i], s.servingQueue[i+1:]...)
-			break
-		}
-	}
-
-	// 添加到回温程序
-	req.StartTime = time.Now() // 重置开始时间用于回温计时
-	s.warmBackMap[req.RoomID] = req
-}
-
-// 更新回温程序中的空调温度
-func (s *ACScheduler) updateWarmBackTemperatures() {
-	currentTime := time.Now()
-	for roomID, req := range s.warmBackMap {
-		// 检查是否已经回温2分钟
-		if currentTime.Sub(req.StartTime) >= 2*time.Minute {
-			// 重新加入调度队列
-			req.RequestTime = currentTime
-			s.AddRequest(req)
-			delete(s.warmBackMap, roomID)
-			continue
-		}
-
-		// 每分钟回温0.5度
-		if int(currentTime.Sub(req.StartTime).Seconds())%60 == 0 && currentTime.Sub(req.StartTime).Seconds() >= 60 {
-			// 获取空调基础信息
-			var ac models.AirConditioner
-			if err := database.DB.Where("room_id = ?", roomID).First(&ac).Error; err != nil {
-				continue
-			}
-
-			// 获取当前温度
-			currentTemp := ac.EnvironmentTemp
-			var lastDetail models.AirConditionerDetail
-			if err := database.DB.Where("room_id = ? AND bill_id = ?", roomID, req.BillID).Order("created_at DESC").First(&lastDetail).Error; err == nil {
-				currentTemp = lastDetail.CurrentTemp
-			}
-
-			// 向初始温度回温0.5度（5个单位）
-			newTemp := currentTemp
-			if currentTemp > ac.EnvironmentTemp {
-				newTemp = currentTemp - 5
-				if newTemp < ac.EnvironmentTemp {
-					newTemp = ac.EnvironmentTemp
-				}
-			} else if currentTemp < ac.EnvironmentTemp {
-				newTemp = currentTemp + 5
-				if newTemp > ac.EnvironmentTemp {
-					newTemp = ac.EnvironmentTemp
-				}
-			}
-
-			// 创建回温状态记录
-			if newTemp != currentTemp {
-				detail := models.AirConditionerDetail{
-					BillID:          req.BillID,
-					RoomID:          roomID,
-					AcID:            req.ACID,
-					OperationType:   3, // 回温程序
-					ACStatus:        1, // 暂停服务状态
-					Speed:           req.CurrentSpeed,
-					Mode:            req.Mode,
-					TargetTemp:      req.TargetTemp,
-					EnvironmentTemp: ac.EnvironmentTemp,
-					CurrentTemp:     newTemp,
-					CurrentCost:     0, // 回温不产生费用
-					TotalCost:       0,
-					QueryTime:       currentTime,
-					StartTime:       req.StartTime,
-					EndTime:         currentTime,
-					ServeTime:       0,
-					QueueWaitTime:   0,
-					Rate:            0,
-					TempChange:      abs(newTemp - currentTemp),
-				}
-				database.DB.Create(&detail)
-			}
-		}
-	}
-}
-
-// 更新关机空调的回温
-func (s *ACScheduler) updateOfflineTemperatures() {
-	// 获取所有关机状态的操作记录
-	var operations []models.AirConditionerOperation
-	database.DB.Where("operation_state = ?", 1).Find(&operations)
-
-	// 每分钟执行一次温度变化
-	currentSeconds := time.Now().Unix()
-	if currentSeconds%60 != 0 {
-		return
-	}
-
-	for _, operation := range operations {
-		// 获取空调基础信息
-		var ac models.AirConditioner
-		if err := database.DB.Where("room_id = ?", operation.RoomID).First(&ac).Error; err != nil {
-			continue
-		}
-
-		// 获取当前温度（从最新的状态记录）
-		currentTemp := operation.CurrentTemp
-		var lastDetail models.AirConditionerDetail
-		if err := database.DB.Where("room_id = ? AND bill_id = ?", operation.RoomID, operation.BillID).Order("created_at DESC").First(&lastDetail).Error; err == nil {
-			currentTemp = lastDetail.CurrentTemp
-		}
-
-		// 关机时每分钟向初始温度回温0.5度（5个单位）
-		if currentTemp != ac.EnvironmentTemp {
-			newTemp := currentTemp
-			if currentTemp > ac.EnvironmentTemp {
-				newTemp = currentTemp - 5
-				if newTemp < ac.EnvironmentTemp {
-					newTemp = ac.EnvironmentTemp
-				}
-			} else {
-				newTemp = currentTemp + 5
-				if newTemp > ac.EnvironmentTemp {
-					newTemp = ac.EnvironmentTemp
-				}
-			}
-
-			// 创建回温状态记录
-			if newTemp != currentTemp {
-				detail := models.AirConditionerDetail{
-					BillID:          operation.BillID,
-					RoomID:          operation.RoomID,
-					AcID:            operation.AcID,
-					OperationType:   1, // 关机回温
-					ACStatus:        2, // 停机状态
-					Speed:           operation.Speed,
-					Mode:            operation.Mode,
-					TargetTemp:      operation.TargetTemp,
-					EnvironmentTemp: ac.EnvironmentTemp,
-					CurrentTemp:     newTemp,
-					CurrentCost:     0, // 关机不产生费用
-					TotalCost:       0,
-					QueryTime:       time.Now(),
-					StartTime:       time.Now(),
-					EndTime:         time.Now(),
-					ServeTime:       0,
-					QueueWaitTime:   0,
-					Rate:            0,
-					TempChange:      abs(newTemp - currentTemp),
-				}
-				database.DB.Create(&detail)
-			}
-		}
-	}
-}
-
-// 检查时间片
-func (s *ACScheduler) checkTimeSlices() {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	now := time.Now()
-	for i := len(s.servingQueue) - 1; i >= 0; i-- {
-		req := s.servingQueue[i]
-		// 检查是否有同优先级的请求在等待
-		hasSamePriorityWaiting := false
-		for _, waitingReq := range s.waitingQueue {
-			if waitingReq.Priority == req.Priority {
-				hasSamePriorityWaiting = true
+// UpdateBufferQueue 将服务队列中的变化更新到缓冲队列中
+func (s *ACScheduler) UpdateBufferQueue() {
+	// 遍历服务队列，将状态变化同步到缓冲队列中对应的空调
+	for _, servingAC := range s.servingQueue {
+		// 在缓冲队列中查找对应的空调
+		for _, bufferAC := range s.bufferQueue {
+			if bufferAC.ACID == servingAC.ACID {
+				// 同步状态信息
+				bufferAC.CurrentTemp = servingAC.CurrentTemp
+				bufferAC.ACState = servingAC.ACState
+				bufferAC.CurrentCost = servingAC.CurrentCost
+				bufferAC.TotalCost = servingAC.TotalCost
+				bufferAC.RunningTime = servingAC.RunningTime
+				bufferAC.RoundRobinCount = servingAC.RoundRobinCount
+				log.Printf("更新缓冲队列中空调ID %d: 温度=%d°C, 状态=%d, 当前费用=%d, 总费用=%d, 运行时间=%d",
+					bufferAC.ACID, bufferAC.CurrentTemp, bufferAC.ACState, bufferAC.CurrentCost, bufferAC.TotalCost, bufferAC.RunningTime)
 				break
 			}
 		}
+	}
 
-		// 只有在有同优先级等待且服务时长达到2分钟时才进行时间片切换
-		if hasSamePriorityWaiting && now.Sub(req.StartTime) >= 2*time.Minute {
-			s.servingQueue = append(s.servingQueue[:i], s.servingQueue[i+1:]...)
-			req.RequestTime = now // 重新设置请求时间
-			s.waitingQueue = append(s.waitingQueue, req)
+	log.Printf("完成服务队列状态同步到缓冲队列")
+}
+
+// refreshTemperature 刷新所有空调的当前温度
+func (s *ACScheduler) refreshTemperature() {
+	// 刷新温度只对服务队列进行刷新
+	for _, scheduler := range s.servingQueue {
+		// 计算温度变化量
+		var tempChange int
+		switch scheduler.CurrentSpeed {
+		case "high":
+			// 高风时每tick变化0.1度
+			tempChange = 1
+		case "medium":
+			// 中风时每两个tick变化0.1度
+			if s.tickCount%2 == 0 {
+				tempChange = 1
+			} else {
+				tempChange = 0
+			}
+		case "low":
+			// 低速时每三个tick变化0.1度
+			if s.tickCount%3 == 0 {
+				tempChange = 1
+			} else {
+				tempChange = 0
+			}
+		default:
+			tempChange = 0
+		}
+
+		// 根据制冷或制热模式调整温度变化方向
+		if tempChange > 0 {
+			if scheduler.Mode == "cooling" {
+				// 制冷模式：温度下降
+				if scheduler.CurrentTemp > scheduler.TargetTemp {
+					scheduler.CurrentTemp -= tempChange
+					// 确保不低于目标温度
+					if scheduler.CurrentTemp < scheduler.TargetTemp {
+						scheduler.CurrentTemp = scheduler.TargetTemp
+					}
+				}
+			} else if scheduler.Mode == "heating" {
+				// 制热模式：温度上升
+				if scheduler.CurrentTemp < scheduler.TargetTemp {
+					scheduler.CurrentTemp += tempChange
+					// 确保不高于目标温度
+					if scheduler.CurrentTemp > scheduler.TargetTemp {
+						scheduler.CurrentTemp = scheduler.TargetTemp
+					}
+				}
+			}
+
+			// 空调花费的金额等于温度变化量
+			scheduler.CurrentCost += tempChange
+			scheduler.TotalCost += tempChange
+
+			// 增加运行时间
+			scheduler.CurrentRunningTime += 6
+			scheduler.RunningTime += 6 // 每个tick为6秒
+
+			log.Printf("空调ID %d: 温度 %d°C -> %d°C, 变化量 %d°C, 当前费用 %d, 总费用 %d",
+				scheduler.ACID, scheduler.CurrentTemp-tempChange, scheduler.CurrentTemp,
+				tempChange, scheduler.CurrentCost, scheduler.TotalCost)
+
+		}
+		// 检查当前温度是否等于目标温度，如果是则修改ACState为3（达到目标温度回温）
+		if scheduler.CurrentTemp == scheduler.TargetTemp {
+			scheduler.ACState = 3
+			log.Printf("空调ID %d 已达到目标温度，状态设置为3（达到目标温度回温）", scheduler.ACID)
+		}
+	}
+
+	log.Printf("完成服务队列温度刷新，队列长度: %d", len(s.servingQueue))
+}
+
+// incrementTimeSliceCount 对队列前三中每个进行时间片调度的空调的时间片数加1
+func (s *ACScheduler) incrementTimeSliceCount() {
+	if s.currentPriority == 0 {
+		return // 没有当前时间片调度优先级，不进行时间片计数
+	}
+
+	// 对服务队列前三个空调中属于当前调度优先级的空调时间片数加1
+	for i := 0; i < len(s.servingQueue) && i < 3; i++ {
+		if s.servingQueue[i].Priority == s.currentPriority {
+			s.servingQueue[i].RoundRobinCount++
+			log.Printf("空调ID %d 时间片数增加到: %d", s.servingQueue[i].ACID, s.servingQueue[i].RoundRobinCount)
 		}
 	}
 }
 
-// 调度下一个请求
-func (s *ACScheduler) scheduleNext() {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	// 如果服务队列未满且有等待请求
-	for len(s.servingQueue) < 3 && len(s.waitingQueue) > 0 {
-		// 按优先级排序等待队列
-		s.sortWaitingQueue()
-
-		// 获取当前服务队列中的最高优先级
-		currentHighestPriority := s.getCurrentHighestPriority()
-
-		// 获取等待队列中的最高优先级
-		waitingHighestPriority := s.waitingQueue[0].Priority
-
-		// 只有当等待队列的最高优先级不低于当前服务队列的最高优先级时才调度
-		if waitingHighestPriority <= currentHighestPriority {
-			// 取出优先级最高的请求
-			req := s.waitingQueue[0]
-			s.waitingQueue = s.waitingQueue[1:]
-
-			// 添加到服务队列
-			req.StartTime = time.Now()
-			s.servingQueue = append(s.servingQueue, req)
-		} else {
-			// 如果等待队列的优先级更低，则不调度，等待当前高优先级完成
-			break
-		}
+// checkAndSwapTimeSliceACs 检查队列前三中是否有时间片数为2的，如果有则进行队列交换
+func (s *ACScheduler) checkAndSwapTimeSliceACs() {
+	if s.currentPriority == 0 || len(s.bufferQueue) == 0 {
+		return // 没有当前时间片调度优先级或缓冲队列为空，不进行交换
 	}
-}
 
-// 按优先级排序等待队列
-func (s *ACScheduler) sortWaitingQueue() {
-	// 简单的冒泡排序，按优先级和请求时间排序
-	for i := 0; i < len(s.waitingQueue)-1; i++ {
-		for j := 0; j < len(s.waitingQueue)-1-i; j++ {
-			// 优先级高的在前，优先级相同时先请求的在前
-			if s.waitingQueue[j].Priority > s.waitingQueue[j+1].Priority ||
-				(s.waitingQueue[j].Priority == s.waitingQueue[j+1].Priority &&
-					s.waitingQueue[j].RequestTime.After(s.waitingQueue[j+1].RequestTime)) {
-				s.waitingQueue[j], s.waitingQueue[j+1] = s.waitingQueue[j+1], s.waitingQueue[j]
+	// 检查服务队列前三个空调中是否有时间片数为2的
+	for i := 0; i < len(s.servingQueue) && i < 3; i++ {
+		if s.servingQueue[i].Priority == s.currentPriority && s.servingQueue[i].RoundRobinCount == 2 {
+			// 找到缓冲队列中当前优先级的末尾位置
+			lastSamePriorityIndex := s.findLastSamePriorityIndex(s.currentPriority)
+			if lastSamePriorityIndex != -1 {
+				// 将时间片数为2的空调交换至缓冲队列当前优先级末尾
+				swapAC := s.servingQueue[i]
+				replaceAC := s.bufferQueue[lastSamePriorityIndex]
+
+				// 执行交换
+				s.servingQueue[i] = replaceAC
+				s.bufferQueue[lastSamePriorityIndex] = swapAC
+
+				// 将新进入服务队列第三位置的空调时间片数改为0
+				if i == 2 {
+					s.servingQueue[i].RoundRobinCount = 0
+				}
+
+				log.Printf("交换空调: 服务队列位置%d的空调ID %d (时间片数2) 与缓冲队列位置%d的空调ID %d",
+					i, swapAC.ACID, lastSamePriorityIndex, replaceAC.ACID)
 			}
 		}
 	}
 }
 
-// 获取当前服务队列中的最高优先级
-func (s *ACScheduler) getCurrentHighestPriority() int {
-	if len(s.servingQueue) == 0 {
-		return 999 // 如果服务队列为空，返回最低优先级
-	}
-
-	highestPriority := s.servingQueue[0].Priority
-	for _, req := range s.servingQueue {
-		if req.Priority < highestPriority {
-			highestPriority = req.Priority
+// findLastSamePriorityIndex 找到缓冲队列中指定优先级的最后一个位置
+func (s *ACScheduler) findLastSamePriorityIndex(priority int) int {
+	lastIndex := -1
+	for i, scheduler := range s.bufferQueue {
+		if scheduler.Priority == priority {
+			lastIndex = i
 		}
 	}
-	return highestPriority
+	return lastIndex
 }
 
-// AddRequest 添加请求到调度器
-func (s *ACScheduler) AddRequest(req *ACRequest) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+// sortBufferQueue 对缓冲队列进行排序
+func (s *ACScheduler) sortBufferQueue() {
+	log.Printf("对缓冲队列进行排序，当前缓冲队列长度: %d", len(s.bufferQueue))
 
-	// 检查是否已经在队列中
-	for _, r := range s.servingQueue {
-		if r.RoomID == req.RoomID {
-			return // 已经在服务队列中
+	// 首先按照风速优先级排序（高速1最高，中速2，低速3最低）
+	sort.Slice(s.bufferQueue, func(i, j int) bool {
+		return s.bufferQueue[i].Priority < s.bufferQueue[j].Priority
+	})
+
+	// 如果当前缓冲队列小于等于3，结束排序，清空当前时间片调度优先级，清空队列所有空调时间片数
+	if len(s.bufferQueue) <= 3 {
+		s.currentPriority = 0
+		for _, scheduler := range s.bufferQueue {
+			scheduler.RoundRobinCount = 0
 		}
+		log.Printf("缓冲队列长度<=3，清空时间片调度优先级和时间片数")
+		return
 	}
-	for _, r := range s.waitingQueue {
-		if r.RoomID == req.RoomID {
-			return // 已经在等待队列中
+
+	// 如果当前队列排第三的空调优先级高于排第四的空调优先级，结束排序
+	if s.bufferQueue[2].Priority < s.bufferQueue[3].Priority {
+		s.currentPriority = 0
+		for _, scheduler := range s.bufferQueue {
+			scheduler.RoundRobinCount = 0
 		}
+		log.Printf("第三位优先级高于第四位，清空时间片调度优先级和时间片数")
+		return
 	}
 
-	// 设置优先级
-	switch req.CurrentSpeed {
-	case "high":
-		req.Priority = 1
-	case "medium":
-		req.Priority = 2
-	case "low":
-		req.Priority = 3
+	// 如果当前队列排第三的空调优先级等于排第四的空调优先级
+	if s.bufferQueue[2].Priority == s.bufferQueue[3].Priority && s.bufferQueue[2].Priority != s.currentPriority {
+		thirdPriority := s.bufferQueue[2].Priority
+
+		// 如果当前时间片调度优先级为空，记录该优先级为当前时间片调度优先级
+		if s.currentPriority == 0 {
+			s.currentPriority = thirdPriority
+			log.Printf("设置当前时间片调度优先级为: %d", s.currentPriority)
+
+		} else if s.currentPriority != thirdPriority {
+			// 如果当前调度优先级与该优先级不同，则清空当前时间片调度优先级，清空队列所有空调时间片数
+			s.currentPriority = 0
+			for _, scheduler := range s.bufferQueue {
+				scheduler.RoundRobinCount = 0
+			}
+			log.Printf("优先级不匹配，清空时间片调度优先级和时间片数")
+			return
+		}
+
+		// 对该优先级的所有空调根据当前服务时间进行排序
+		s.sortByServiceTimeAndID(thirdPriority)
+
+		// 对重新排序后不在队列前三的空调，将其时间片数设置为2，在前三的将其时间片设置为0
+		for i, scheduler := range s.bufferQueue {
+			if scheduler.Priority == thirdPriority {
+				if i < 3 {
+					scheduler.RoundRobinCount = 0
+				} else {
+					scheduler.RoundRobinCount = 2
+				}
+			}
+		}
+		log.Printf("完成优先级%d的时间片数设置", thirdPriority)
 	}
 
-	// 检查是否可以抢占低优先级的服务
-	if len(s.servingQueue) < 3 {
-		// 服务队列未满，直接加入
-		req.StartTime = time.Now()
-		s.servingQueue = append(s.servingQueue, req)
-	} else {
-		// 服务队列已满，检查是否可以抢占
-		lowestPriorityInServing := s.getLowestPriorityInServing()
-		if req.Priority < lowestPriorityInServing {
-			// 新请求优先级更高，抢占最低优先级的服务
-			s.preemptLowestPriority(req)
+	// 在每次时间片调度开启时，对队列前三中每个进行时间片调度的空调的时间片数加1
+	s.incrementTimeSliceCount()
+
+	// 在完成时间片数增加后，检查队列前三中是否有时间片数为2的，如果有则进行队列交换
+	s.checkAndSwapTimeSliceACs()
+
+}
+
+// sortByServiceTimeAndID 对指定优先级的空调按服务时间和ID排序
+func (s *ACScheduler) sortByServiceTimeAndID(priority int) {
+	// 找出所有指定优先级的空调
+	var samepriorityACs []*models.Scheduler
+	var otherACs []*models.Scheduler
+
+	for _, scheduler := range s.bufferQueue {
+		if scheduler.Priority == priority {
+			samepriorityACs = append(samepriorityACs, scheduler)
 		} else {
-			// 无法抢占，加入等待队列
-			req.RequestTime = time.Now()
-			s.waitingQueue = append(s.waitingQueue, req)
-		}
-	}
-}
-
-// 获取服务队列中的最低优先级
-func (s *ACScheduler) getLowestPriorityInServing() int {
-	if len(s.servingQueue) == 0 {
-		return 0
-	}
-
-	lowestPriority := s.servingQueue[0].Priority
-	for _, req := range s.servingQueue {
-		if req.Priority > lowestPriority {
-			lowestPriority = req.Priority
-		}
-	}
-	return lowestPriority
-}
-
-// 抢占最低优先级的服务
-func (s *ACScheduler) preemptLowestPriority(newReq *ACRequest) {
-	// 找到最低优先级的请求
-	lowestPriorityIndex := -1
-	lowestPriority := 0
-
-	for i, req := range s.servingQueue {
-		if req.Priority > lowestPriority {
-			lowestPriority = req.Priority
-			lowestPriorityIndex = i
+			otherACs = append(otherACs, scheduler)
 		}
 	}
 
-	if lowestPriorityIndex != -1 {
-		// 将被抢占的请求移到等待队列
-		preemptedReq := s.servingQueue[lowestPriorityIndex]
-		preemptedReq.RequestTime = time.Now()
-		s.servingQueue = append(s.servingQueue[:lowestPriorityIndex], s.servingQueue[lowestPriorityIndex+1:]...)
-		s.waitingQueue = append(s.waitingQueue, preemptedReq)
+	// 对同优先级的空调按服务时间排序，如果服务时间相同则按ID排序
+	sort.Slice(samepriorityACs, func(i, j int) bool {
+		if samepriorityACs[i].RunningTime == samepriorityACs[j].RunningTime {
+			return samepriorityACs[i].ACID < samepriorityACs[j].ACID
+		}
+		return samepriorityACs[i].RunningTime < samepriorityACs[j].RunningTime
+	})
 
-		// 将新请求加入服务队列
-		newReq.StartTime = time.Now()
-		s.servingQueue = append(s.servingQueue, newReq)
-	}
+	// 重新构建缓冲队列：先放其他优先级的，再放排序后的同优先级的
+	s.bufferQueue = make([]*models.Scheduler, 0)
+	s.bufferQueue = append(s.bufferQueue, otherACs...)
+	s.bufferQueue = append(s.bufferQueue, samepriorityACs...)
+
+	// 重新按优先级排序整个队列
+	sort.Slice(s.bufferQueue, func(i, j int) bool {
+		return s.bufferQueue[i].Priority < s.bufferQueue[j].Priority
+	})
+
+	log.Printf("完成优先级%d的服务时间和ID排序", priority)
 }
 
-// RemoveRequest 移除请求
-func (s *ACScheduler) RemoveRequest(roomID int) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+// updateServingQueue 更新服务队列为缓冲队列排序后的前三个
+func (s *ACScheduler) updateServingQueue() {
+	if len(s.bufferQueue) == 0 {
+		return
+	}
 
-	// 从服务队列中移除
-	for i, req := range s.servingQueue {
-		if req.RoomID == roomID {
-			s.servingQueue = append(s.servingQueue[:i], s.servingQueue[i+1:]...)
-			return
+	// 取缓冲队列前三个作为新的服务队列
+	maxServing := 3
+	if len(s.bufferQueue) < maxServing {
+		maxServing = len(s.bufferQueue)
+	}
+
+	// 清空当前服务队列
+	s.servingQueue = make([]*models.Scheduler, 0)
+
+	// 将缓冲队列前三个移到服务队列
+	for i := 0; i < maxServing; i++ {
+		s.servingQueue = append(s.servingQueue, s.bufferQueue[i])
+	}
+
+	// 更新ACState：缓冲队列中不在服务队列的设为1，在服务队列的设为0
+	for i, scheduler := range s.bufferQueue {
+		if i < maxServing {
+			// 在服务队列中的设为0（运行）
+			scheduler.ACState = 0
+		} else {
+			// 不在服务队列中的设为1（在等待序列）
+			scheduler.ACState = 1
 		}
 	}
 
-	// 从等待队列中移除
-	for i, req := range s.waitingQueue {
-		if req.RoomID == roomID {
-			s.waitingQueue = append(s.waitingQueue[:i], s.waitingQueue[i+1:]...)
-			return
+	log.Printf("服务队列已更新")
+}
+
+func (s *ACScheduler) refreshWarmingQueue() {
+	// 回温队列中所有空调每2个tick刷新1度
+	for _, scheduler := range s.warmingQueue {
+		// 每2个tick变化1度
+		if s.tickCount%2 == 0 {
+			// 根据模式决定回温方向
+			if scheduler.Mode == "cool" {
+				// 制冷模式回温：温度上升，但不能超过环境温度
+				if scheduler.CurrentTemp < scheduler.EnvironmentTemp {
+					scheduler.CurrentTemp += 1
+					log.Printf("空调ID %d 制冷回温：温度 %d°C -> %d°C", scheduler.ACID, scheduler.CurrentTemp-1, scheduler.CurrentTemp)
+				} else {
+					log.Printf("空调ID %d 制冷回温：已达到环境温度 %d°C，停止回温", scheduler.ACID, scheduler.EnvironmentTemp)
+				}
+			} else if scheduler.Mode == "heat" {
+				// 制热模式回温：温度下降，但不能低于环境温度
+				if scheduler.CurrentTemp > scheduler.EnvironmentTemp {
+					scheduler.CurrentTemp -= 1
+					log.Printf("空调ID %d 制热回温：温度 %d°C -> %d°C", scheduler.ACID, scheduler.CurrentTemp+1, scheduler.CurrentTemp)
+				} else {
+					log.Printf("空调ID %d 制热回温：已达到环境温度 %d°C，停止回温", scheduler.ACID, scheduler.EnvironmentTemp)
+				}
+			}
 		}
 	}
 
-	// 从回温程序中移除
-	delete(s.warmBackMap, roomID)
+	if len(s.warmingQueue) > 0 {
+		log.Printf("回温队列已更新，当前队列长度: %d", len(s.warmingQueue))
+	}
 }
 
-// GetServingQueue 获取服务队列（只读）
-func (s *ACScheduler) GetServingQueue() []*ACRequest {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	return append([]*ACRequest(nil), s.servingQueue...)
+// updateWarmingQueue 更新回温队列
+func (s *ACScheduler) updateWarmingQueue() {
+	// 第一步：检查缓冲队列中ACState为2或3的，将其移除并加入回温队列
+	var newBufferQueue []*models.Scheduler
+	for _, scheduler := range s.bufferQueue {
+		if scheduler.ACState == 2 || scheduler.ACState == 3 {
+			// 当ACState为2时，需要额外操作：在空调操作表中查找当前账单号最后一次关机调度并保存信息
+			if scheduler.ACState == 2 {
+				s.saveShutdownOperationToDB(scheduler)
+			}
+
+			// 移除并加入回温队列
+			s.warmingQueue = append(s.warmingQueue, scheduler)
+			log.Printf("空调ID %d 从缓冲队列移除并加入回温队列，ACState: %d", scheduler.ACID, scheduler.ACState)
+		} else {
+			// 保留在缓冲队列中
+			newBufferQueue = append(newBufferQueue, scheduler)
+		}
+	}
+	s.bufferQueue = newBufferQueue
+
+	// 第二步：检查回温队列中ACState为3且当前温度和目标温度差值绝对值为10的
+	var newWarmingQueue []*models.Scheduler
+	for _, scheduler := range s.warmingQueue {
+		if scheduler.ACState == 3 {
+			// 计算温度差值的绝对值
+			tempDiff := scheduler.CurrentTemp - scheduler.TargetTemp
+			if tempDiff < 0 {
+				tempDiff = -tempDiff
+			}
+
+			if tempDiff == 10 {
+				// 修改ACState为1，移出回温队列，加入缓冲队列
+				scheduler.ACState = 1
+				s.bufferQueue = append(s.bufferQueue, scheduler)
+				log.Printf("空调ID %d 从回温队列移除并加入缓冲队列，ACState设置为1（在等待序列），温度差值: %d", scheduler.ACID, tempDiff)
+			} else {
+				// 保留在回温队列中
+				newWarmingQueue = append(newWarmingQueue, scheduler)
+			}
+		} else {
+			// 保留在回温队列中
+			newWarmingQueue = append(newWarmingQueue, scheduler)
+		}
+	}
+	s.warmingQueue = newWarmingQueue
+
+	log.Printf("updateWarmingQueue完成 - 缓冲队列: %d, 回温队列: %d", len(s.bufferQueue), len(s.warmingQueue))
 }
 
-// GetWaitingQueue 获取等待队列（只读）
-func (s *ACScheduler) GetWaitingQueue() []*ACRequest {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	return append([]*ACRequest(nil), s.waitingQueue...)
+// GetSchedulerStatus 获取调度器状态（管理员接口）
+func GetSchedulerStatus(c *gin.Context) {
+	scheduler := GetScheduler()
+	scheduler.mu.RLock()
+	defer scheduler.mu.RUnlock()
+
+	c.JSON(200, gin.H{
+		"message":          "获取调度器状态成功",
+		"is_running":       scheduler.isRunning,
+		"serving_count":    len(scheduler.servingQueue),
+		"buffer_count":     len(scheduler.bufferQueue),
+		"warming_count":    len(scheduler.warmingQueue),
+		"total_requests":   len(scheduler.schedulers),
+		"tick_count":       scheduler.tickCount,
+		"current_priority": scheduler.currentPriority,
+		"first_ac_added":   scheduler.firstACAdded,
+		"serving_queue":    scheduler.servingQueue,
+		"buffer_queue":     scheduler.bufferQueue,
+		"warming_queue":    scheduler.warmingQueue,
+	})
+}
+
+// saveACStatesToDB 保存空调状态到数据库
+// 按照指定顺序：先保存服务队列中的内容，再保存缓存队列第四个开始的内容，最后保存回温队列中的内容
+func (s *ACScheduler) saveACStatesToDB() {
+	// 1. 先保存服务队列中的内容
+	for _, ac := range s.servingQueue {
+		s.saveACDetailToDB(ac, 0) // ACStatus = 0 表示运行状态
+	}
+
+	// 2. 再保存缓存队列第四个开始的内容
+	for i := 3; i < len(s.bufferQueue); i++ { // 从第4个开始（索引3）
+		s.saveACDetailToDB(s.bufferQueue[i], 1) // ACStatus = 1 表示在等待序列
+	}
+
+	// 3. 最后保存回温队列中的内容
+	for _, ac := range s.warmingQueue {
+		// 根据ACState判断回温状态：2-关机回温，3-达到目标温度回温
+		acStatus := 2
+		if ac.ACState == 3 {
+			acStatus = 3
+		}
+		s.saveACDetailToDB(ac, acStatus)
+	}
+
+	log.Printf("已保存空调状态到数据库 - 服务队列: %d, 缓冲队列(第4个开始): %d, 回温队列: %d",
+		len(s.servingQueue),
+		max(0, len(s.bufferQueue)-3),
+		len(s.warmingQueue))
+}
+
+// saveACDetailToDB 保存单个空调状态到数据库
+func (s *ACScheduler) saveACDetailToDB(ac *models.Scheduler, acStatus int) {
+	// 计算费率（根据风速）
+	var rate float32
+	switch ac.CurrentSpeed {
+	case "high":
+		rate = 1.0
+	case "medium":
+		rate = 0.5
+	case "low":
+		rate = 0.33
+	default:
+		rate = 0.5
+	}
+
+	// 计算温度变化（当前温度与环境温度的差值）
+	tempChange := ac.CurrentTemp - ac.EnvironmentTemp
+
+	// 创建空调状态记录
+	acDetail := models.AirConditionerDetail{
+		BillID:             ac.BillID,
+		RoomID:             ac.RoomID,
+		AcID:               ac.ACID,
+		ACStatus:           acStatus,
+		Speed:              ac.CurrentSpeed,
+		Mode:               ac.Mode,
+		TargetTemp:         ac.TargetTemp,
+		EnvironmentTemp:    ac.EnvironmentTemp,
+		CurrentTemp:        ac.CurrentTemp,
+		RunningTime:        ac.RunningTime,
+		CurrentRunningTime: ac.CurrentRunningTime,
+		CurrentCost:        float32(ac.CurrentCost),
+		TotalCost:          float32(ac.TotalCost),
+		Rate:               rate,
+		TempChange:         tempChange,
+	}
+
+	// 保存到数据库
+	if err := database.DB.Create(&acDetail).Error; err != nil {
+		log.Printf("保存空调状态失败 - RoomID: %d, ACID: %d, Error: %v", ac.RoomID, ac.ACID, err)
+	} else {
+		log.Printf("保存空调状态成功 - RoomID: %d, ACID: %d, Status: %d", ac.RoomID, ac.ACID, acStatus)
+	}
+}
+
+// saveShutdownOperationToDB 当ACState为2时，在空调操作表中查找当前账单号最后一次关机调度并保存信息
+func (s *ACScheduler) saveShutdownOperationToDB(scheduler *models.Scheduler) {
+	// 查找当前账单号最后一次关机调度（OperationState = 1表示关机）
+	var lastShutdownOp models.AirConditionerOperation
+	err := database.DB.Where("bill_id = ? AND room_id = ? AND operation_state = ?",
+		scheduler.BillID, scheduler.RoomID, 1).Order("created_at DESC").First(&lastShutdownOp).Error
+
+	if err != nil {
+		log.Printf("未找到账单号 %d 房间 %d 的最后一次关机调度记录: %v", scheduler.BillID, scheduler.RoomID, err)
+		return
+	}
+
+	// 更新最后一次关机调度记录，保存当前花费、当前温度、当前时间
+	lastShutdownOp.CurrentCost = float32(scheduler.CurrentCost)
+	lastShutdownOp.CurrentTemp = scheduler.CurrentTemp
+	lastShutdownOp.RunningTime = scheduler.RunningTime // 使用RunningTime作为当前时间
+	lastShutdownOp.CurrentRunningTime = scheduler.CurrentRunningTime
+	lastShutdownOp.UpdatedAt = time.Now()
+
+	// 保存更新到数据库
+	if err := database.DB.Save(&lastShutdownOp).Error; err != nil {
+		log.Printf("保存关机调度信息失败 - BillID: %d, RoomID: %d, Error: %v",
+			scheduler.BillID, scheduler.RoomID, err)
+	} else {
+		log.Printf("保存关机调度信息成功 - BillID: %d, RoomID: %d, CurrentCost: %.2f, CurrentTemp: %d, RunningTime: %d",
+			scheduler.BillID, scheduler.RoomID, float32(scheduler.CurrentCost), scheduler.CurrentTemp, scheduler.RunningTime)
+	}
+}
+
+// max 返回两个整数中的较大值
+func max(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
 }

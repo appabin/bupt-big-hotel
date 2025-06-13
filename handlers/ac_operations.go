@@ -12,7 +12,6 @@ import (
 
 // ACControlRequest 空调控制请求结构
 type ACControlRequest struct {
-	BillID        int `json:"bill_id"`               // 订单号
 	OperationType int    `json:"operation_type"`        // 操作类型：0-开机 1-关机 2-调温
 	Speed         string `json:"speed,omitempty"`       // 风速：high/medium/low
 	Mode          string `json:"mode,omitempty"`        // 模式：cooling/heating
@@ -52,10 +51,20 @@ func ControlAirConditioner(c *gin.Context) {
 		return
 	}
 
-	// 验证订单号
-	if req.BillID == 0 {
+	// 从房间操作表中获取当前房间的有效订单号
+	var roomOperation models.RoomOperation
+	if err := database.DB.Where("room_id = ? AND operation_type = ?", roomID, "checkin").Order("operation_time DESC").First(&roomOperation).Error; err != nil {
+		c.JSON(http.StatusNotFound, gin.H{
+			"error": "该房间没有有效的入住记录，无法操作空调",
+		})
+		return
+	}
+
+	// 使用从房间操作表获取的订单号
+	billID := roomOperation.BillID
+	if billID == 0 {
 		c.JSON(http.StatusBadRequest, gin.H{
-			"error": "订单号不能为空",
+			"error": "房间操作记录中订单号无效",
 		})
 		return
 	}
@@ -69,15 +78,12 @@ func ControlAirConditioner(c *gin.Context) {
 		return
 	}
 
-	currentTime := time.Now()
-
 	// 创建空调操作记录
 	operation := models.AirConditionerOperation{
-		BillID:            req.BillID,
-		RoomID:            ac.RoomID,
-		AcID:              ac.ID,
-		OperationState:    req.OperationType,
-		LastOperationTime: currentTime,
+		BillID:         billID,
+		RoomID:         ac.RoomID,
+		AcID:           ac.ID,
+		OperationState: req.OperationType,
 	}
 
 	// 根据操作类型设置参数
@@ -86,7 +92,7 @@ func ControlAirConditioner(c *gin.Context) {
 		operation.Mode = "heating" // 默认制热
 		operation.TargetTemp = 220 // 默认22度
 		operation.Speed = "medium" // 默认中风
-		operation.LastPowerOnTime = currentTime
+
 		operation.SwitchCount = 1
 		// 如果用户指定了参数，使用用户参数
 		if req.Mode != "" {
@@ -102,17 +108,19 @@ func ControlAirConditioner(c *gin.Context) {
 	case 1: // 关机
 		// 关机操作，获取当前设置
 		var lastOp models.AirConditionerOperation
-		if err := database.DB.Where("room_id = ? AND bill_id = ?", ac.RoomID, req.BillID).Order("created_at DESC").First(&lastOp).Error; err == nil {
+		if err := database.DB.Where("room_id = ? AND bill_id = ?", ac.RoomID, billID).Order("created_at DESC").First(&lastOp).Error; err == nil {
 			operation.Mode = lastOp.Mode
 			operation.TargetTemp = lastOp.TargetTemp
 			operation.Speed = lastOp.Speed
 			operation.SwitchCount = lastOp.SwitchCount + 1
+			operation.RunningTime = 0
+			operation.CurrentRunningTime = 0
 		}
 
 	case 2: // 调温或其他设置
 		// 获取当前设置作为基础
 		var lastOp models.AirConditionerOperation
-		if err := database.DB.Where("room_id = ? AND bill_id = ?", ac.RoomID, req.BillID).Order("created_at DESC").First(&lastOp).Error; err == nil {
+		if err := database.DB.Where("room_id = ? AND bill_id = ?", ac.RoomID, billID).Order("created_at DESC").First(&lastOp).Error; err == nil {
 			operation.Mode = lastOp.Mode
 			operation.TargetTemp = lastOp.TargetTemp
 			operation.Speed = lastOp.Speed
@@ -146,55 +154,70 @@ func ControlAirConditioner(c *gin.Context) {
 	scheduler := GetScheduler()
 	switch req.OperationType {
 	case 0: // 开机
-		acRequest := &ACRequest{
-			BillID:        req.BillID,
-			RoomID:        ac.RoomID,
-			ACID:          ac.ID,
-			Mode:          operation.Mode,
-			CurrentSpeed:  operation.Speed,
-			TargetTemp:    operation.TargetTemp,
-			RequestTime:   currentTime,
-			OperationType: req.OperationType,
+		// 根据风速设置优先级
+		var priority int
+		switch operation.Speed {
+		case "high":
+			priority = 1
+		case "medium":
+			priority = 2
+		case "low":
+			priority = 3
+		default:
+			priority = 2 // 默认中等优先级
 		}
-		scheduler.AddRequest(acRequest)
+
+		schedulerObj := &models.Scheduler{
+			ACID:               ac.ID,
+			RoomID:             ac.RoomID,
+			BillID:             billID,
+			ACState:            0, // 运行状态
+			Mode:               operation.Mode,
+			Priority:           priority,
+			CurrentSpeed:       operation.Speed,
+			CurrentTemp:        ac.EnvironmentTemp,
+			TargetTemp:         operation.TargetTemp,
+			EnvironmentTemp:    ac.EnvironmentTemp,
+			CurrentCost:        0,
+			TotalCost:          0,
+			CurrentRunningTime: 0,
+			RunningTime:        0,
+			RoundRobinCount:    0,
+		}
+		scheduler.AddRequest(schedulerObj)
 	case 1: // 关机
-		scheduler.RemoveRequest(ac.RoomID)
+		scheduler.RemoveRequest(ac.ID)
 	case 2: // 调温或其他设置
-		// 先移除旧的请求
-		scheduler.RemoveRequest(ac.RoomID)
-		// 添加新的请求
-		acRequest := &ACRequest{
-			BillID:        req.BillID,
-			RoomID:        ac.RoomID,
-			ACID:          ac.ID,
-			Mode:          operation.Mode,
-			CurrentSpeed:  operation.Speed,
-			TargetTemp:    operation.TargetTemp,
-			RequestTime:   currentTime,
-			OperationType: req.OperationType,
+		// 根据风速设置优先级
+		var priority int
+		switch operation.Speed {
+		case "high":
+			priority = 1
+		case "medium":
+			priority = 2
+		case "low":
+			priority = 3
+		default:
+			priority = 2 // 默认中等优先级
 		}
-		scheduler.AddRequest(acRequest)
+
+		// 调温操作：查找缓冲队列中的对应空调并更新目标温度和风速
+		scheduler.UpdateACInBuffer(ac.ID, operation.TargetTemp, operation.Speed, priority)
 	}
 
-	// 获取最新的状态记录用于响应
-	var detail models.AirConditionerDetail
-	if err := database.DB.Where("room_id = ? AND bill_id = ?", ac.RoomID, req.BillID).Order("created_at DESC").First(&detail).Error; err != nil {
-		// 如果没有状态记录，返回操作记录信息
-		c.JSON(http.StatusOK, gin.H{
-			"message": "空调控制成功",
-			"data": map[string]interface{}{
-				"room_id":        ac.RoomID,
-				"bill_id":        req.BillID,
-				"operation_type": req.OperationType,
-				"message":        "操作成功，等待调度器更新状态",
-			},
-		})
-		return
+	// 直接返回基于操作记录的响应
+	responseData := &ACStatusResponse{
+		RoomID:          ac.RoomID,
+		ACStatus:        getACStatusFromOperation(req.OperationType),
+		Speed:           operation.Speed,
+		Mode:            operation.Mode,
+		TargetTemp:      operation.TargetTemp,
+		EnvironmentTemp: operation.EnvironmentTemp,
 	}
 
 	c.JSON(http.StatusOK, gin.H{
 		"message": "空调控制成功",
-		"data":    convertToStatusResponse(detail),
+		"data":    responseData,
 	})
 }
 
@@ -209,14 +232,14 @@ func GetACStatusLongPolling(c *gin.Context) {
 		})
 		return
 	}
-	
+
 	if roomID == "" {
 		c.JSON(http.StatusBadRequest, gin.H{
 			"error": "房间ID不能为空",
 		})
 		return
 	}
-	
+
 	if billID == 0 {
 		c.JSON(http.StatusBadRequest, gin.H{
 			"error": "订单号不能为空",
@@ -277,7 +300,7 @@ func getACCurrentStatus(roomID string, billID int) *ACStatusResponse {
 		if err := database.DB.Where("room_id = ? AND bill_id = ?", roomID, billID).Order("created_at DESC").First(&operation).Error; err != nil {
 			return nil
 		}
-		
+
 		// 根据操作记录构造状态响应
 		roomIDInt, _ := strconv.Atoi(roomID)
 		return &ACStatusResponse{
@@ -295,6 +318,20 @@ func getACCurrentStatus(roomID string, billID int) *ACStatusResponse {
 	}
 
 	return convertToStatusResponse(detail)
+}
+
+// getACStatusFromOperation 根据操作类型获取空调状态
+func getACStatusFromOperation(operationType int) int {
+	switch operationType {
+	case 0: // 开机
+		return 0 // 运行状态
+	case 1: // 关机
+		return 2 // 停机状态
+	case 2: // 调温或其他设置
+		return 0 // 运行状态
+	default:
+		return 2 // 默认停机状态
+	}
 }
 
 // convertToStatusResponse 转换为状态响应格式

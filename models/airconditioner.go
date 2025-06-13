@@ -9,12 +9,12 @@ type AirConditioner struct {
 	EnvironmentTemp int `gorm:"type:int;default:250"` // 环境温度*10
 }
 
-//空调操作表
+// 空调操作表
 type AirConditionerOperation struct {
 	ID     int `gorm:"primaryKey"`
 	BillID int `gorm:"type:int;index"` // 订单号
 	RoomID int `gorm:"type:int;index"` // 房间ID
-	AcID   int    `gorm:"type:int;index"`         // 关联空调ID
+	AcID   int `gorm:"type:int;index"` // 关联空调ID
 
 	// 空调操作状态：0-开机 1-关机 2-调温
 	OperationState int `gorm:"type:int;default:1"` // 0: 开机 1: 关机 2: 调温
@@ -35,10 +35,8 @@ type AirConditionerOperation struct {
 	TotalCost   float32 `gorm:"type:float(10,2);default:0"` // 总花费金额
 
 	// 时间信息
-	CurrentServeTime  float32   `gorm:"type:float(10,2);default:0"` // 当前被服务时间(分钟)
-	QueueWaitTime     float32   `gorm:"type:float(10,2);default:0"` // 当前在服务队列中等待时间(分钟)
-	LastPowerOnTime   time.Time `gorm:"type:datetime"`              // 记录最后一次开机时间
-	LastOperationTime time.Time `gorm:"type:datetime"`              // 最后操作时间
+	RunningTime        int `gorm:"type:int"` // 记录运行时间
+	CurrentRunningTime int `gorm:"type:int"` // 记录总运行时间
 
 	// 统计信息
 	SwitchCount int       `gorm:"type:int;default:0"` // 开关次数
@@ -51,13 +49,9 @@ type AirConditionerDetail struct {
 	ID     int `gorm:"primary_key"`
 	BillID int `gorm:"type:int;index"` // 订单号
 	RoomID int `gorm:"type:int;index"` // 房间ID
-	AcID   int    `gorm:"type:int;index"`         // 关联空调ID
+	AcID   int `gorm:"type:int;index"` // 关联空调ID
 
-	// 操作类型：0-开机 1-关机 2-调温
-	OperationType int `gorm:"type:int"` // 0: 开机 1: 关机 2: 调温
-
-	// 空调状态：0-运行 1-暂停服务 2-停机
-	ACStatus int `gorm:"type:int"` // 0: 运行 1: 暂停服务 2: 停机
+	ACStatus int `gorm:"type:int"` //0-运行 1-在等待序列 2-关机回温 3-达到目标温度回温
 
 	// 风速：high-高速 medium-中速 low-低速
 	Speed string `gorm:"type:varchar(20)"` // high/medium/low
@@ -70,16 +64,11 @@ type AirConditionerDetail struct {
 	EnvironmentTemp int `gorm:"type:int"` // 环境温度*10
 	CurrentTemp     int `gorm:"type:int"` // 当前温度*10
 
+	RunningTime        int `gorm:"type:int"` // 记录运行时间
+	CurrentRunningTime int `gorm:"type:int"` // 记录总运行时间
 	// 费用信息
 	CurrentCost float32 `gorm:"type:float(10,2)"` // 当前花费金额
 	TotalCost   float32 `gorm:"type:float(10,2)"` // 总花费金额
-
-	// 时间信息
-	QueryTime     time.Time `gorm:"type:datetime"`    // 查询时间
-	StartTime     time.Time `gorm:"type:datetime"`    // 开始时间
-	EndTime       time.Time `gorm:"type:datetime"`    // 结束时间
-	ServeTime     float32   `gorm:"type:float(10,2)"` // 当前被服务时间(分钟)
-	QueueWaitTime float32   `gorm:"type:float(10,2)"` // 在服务队列中等待时间(分钟)
 
 	// 费率和变化信息
 	Rate       float32 `gorm:"type:float(5,2)"` // 每分钟费率(元/分钟)
