@@ -250,13 +250,13 @@ func CheckoutRoom(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{
 		"message": "退房成功",
 		"data": gin.H{
-			"room_id":        roomID,
-			"bill_id":        billID,
-			"actual_cost":    actualCost,
-			"actual_days":    actualDays,
-			"checkout_time":  checkoutTime,
-			"report_file":    filePath,
-			"ac_operations":  acOperations,
+			"room_id":       roomID,
+			"bill_id":       billID,
+			"actual_cost":   actualCost,
+			"actual_days":   actualDays,
+			"checkout_time": checkoutTime,
+			"report_file":   filePath,
+			"ac_operations": acOperations,
 		},
 	})
 }
